@@ -799,26 +799,69 @@ class ExecutionService:
         )
 
     @staticmethod
+    def _read_single_checkpoint_file(checkpoint_file: Path) -> dict[str, Any]:
+        """Read one processor checkpoint file's `_metadata` block, if it exists."""
+        if not checkpoint_file.exists():
+            return {}
+
+        with open(checkpoint_file, 'r') as f:
+            checkpoint_data = json.load(f)
+
+        metadata = checkpoint_data.get('_metadata', {})
+        return {
+            'total_processed': metadata.get('total_processed', 0),
+            'total_files': metadata.get('total_files', 0),
+            'last_updated': metadata.get('last_updated'),
+        }
+
+    @staticmethod
     def _read_processor_checkpoint_file(execution_id: UUID) -> dict[str, Any]:
         """
-        Read the processor's checkpoint file to get real-time progress.
-        Returns dict with 'total_processed' and 'total_files' if checkpoint exists.
+        Read real-time row progress for an in-progress execution.
+
+        Without main-batch splitting there is a single processor_output/ checkpoint.
+        With it on, each main batch has its own processor_output/batch_NNN/ checkpoint —
+        completed batches are counted from their merged_output.csv (exact; the checkpoint
+        for a finished batch is already gone), and the first batch without a
+        merged_output.csv yet is the one currently in flight, whose own checkpoint
+        supplies the live in-progress count.
         """
         try:
-            checkpoint_dir = Path(settings.EXECUTION_WORKSPACE_ROOT) / str(execution_id) / "processor_output"
-            checkpoint_file = checkpoint_dir / ".processing_checkpoint.json"
-            
-            if not checkpoint_file.exists():
-                return {}
-            
-            with open(checkpoint_file, 'r') as f:
-                checkpoint_data = json.load(f)
-            
-            metadata = checkpoint_data.get('_metadata', {})
+            execution_root = Path(settings.EXECUTION_WORKSPACE_ROOT) / str(execution_id)
+            manifest_file = execution_root / "main_batches" / "batch_manifest.json"
+
+            if not manifest_file.exists():
+                return ExecutionService._read_single_checkpoint_file(
+                    execution_root / "processor_output" / ".processing_checkpoint.json"
+                )
+
+            from services.execution_processor import _count_csv_rows
+
+            with open(manifest_file, 'r') as f:
+                total_batches = json.load(f).get('total_batches', 0)
+
+            total_processed = 0
+            last_updated = None
+            for batch_index in range(total_batches):
+                batch_output_dir = execution_root / "processor_output" / f"batch_{batch_index:03d}"
+                merged_output_csv = batch_output_dir / "merged_output.csv"
+                if merged_output_csv.exists():
+                    row_count, _ = _count_csv_rows(merged_output_csv)
+                    total_processed += row_count
+                    continue
+
+                # First batch without a merged output yet is the one in flight.
+                live_checkpoint = ExecutionService._read_single_checkpoint_file(
+                    batch_output_dir / ".processing_checkpoint.json"
+                )
+                total_processed += live_checkpoint.get('total_processed', 0)
+                last_updated = live_checkpoint.get('last_updated')
+                break
+
             return {
-                'total_processed': metadata.get('total_processed', 0),
-                'total_files': metadata.get('total_files', 0),
-                'last_updated': metadata.get('last_updated')
+                'total_processed': total_processed,
+                'total_files': 1,
+                'last_updated': last_updated,
             }
         except Exception as e:
             logger.debug(f"Could not read processor checkpoint for execution {execution_id}: {e}")

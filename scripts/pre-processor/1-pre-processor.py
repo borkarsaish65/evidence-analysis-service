@@ -42,6 +42,14 @@ def _parse_args():
         default=None,
         help="Comma list of allowed evidence types (image,pdf,excel); absent or empty = all",
     )
+    parser.add_argument("--main-batch-rows", default=None, type=int, help="Target rows per main batch")
+    parser.add_argument("--max-main-batches", default=None, type=int, help="Hard cap on number of main batches")
+    parser.add_argument(
+        "--skip-batch-cut",
+        action="store_true",
+        help="Run the normal filter/sort/split path even if MAIN_FILE_SPLIT is on — "
+        "used for the per-batch sub-invocations, whose input is already one main batch.",
+    )
     parser.add_argument("--max-relevant-per-user-task", default=None, type=int, help="Per-(UUID, task) relevant-evidence cap; enables group-aware splitting when set")
     return parser.parse_args()
 
@@ -85,11 +93,27 @@ ROWS_PER_FILE = ARGS.rows_per_file or int(os.getenv("PREPROCESS_ROWS_PER_FILE", 
 # Off by default → original size-only splitting.
 GROUP_AWARE_SPLIT = ARGS.max_relevant_per_user_task is not None
 
+# === MAIN-BATCH CONFIGURATION ===
+# MAIN_FILE_SPLIT is the on/off switch (mirrors the sister repo's SPLIT_FILES=yes/no
+# convention): "true" cuts the filtered+sorted rows into sequential main batches before
+# the normal per-file split runs on each one; "no"/absent processes everything as a
+# single main file, today's behavior, unchanged.
+MAIN_FILE_SPLIT = str2bool(os.getenv("MAIN_FILE_SPLIT", "no"))
+# Sizing target (rows per batch) — batch COUNT is derived from this, not set directly,
+# same shape as ROWS_PER_FILE deriving the fine-split file count above.
+MAIN_BATCH_ROWS_PER_BATCH = ARGS.main_batch_rows or int(os.getenv("MAIN_BATCH_ROWS_PER_BATCH", "10000"))
+# Safety ceiling, not a target: only overrides the derived count above if it would
+# otherwise exceed this many batches (then the effective batch size grows instead).
+MAX_MAIN_BATCHES = ARGS.max_main_batches or int(os.getenv("MAX_MAIN_BATCHES", "200"))
+
 # Debug: Print loaded configuration
 print(f"🔧 Configuration Loaded:")
 print(f"   SPLIT_FILES: {SPLIT_FILES}")
 print(f"   ROWS_PER_FILE: {ROWS_PER_FILE}")
 print(f"   GROUP_AWARE_SPLIT: {GROUP_AWARE_SPLIT}")
+print(f"   MAIN_FILE_SPLIT: {MAIN_FILE_SPLIT}")
+print(f"   MAIN_BATCH_ROWS_PER_BATCH: {MAIN_BATCH_ROWS_PER_BATCH}")
+print(f"   MAX_MAIN_BATCHES: {MAX_MAIN_BATCHES}")
 print(f"   USE_SCHOOL_FILTER: {USE_SCHOOL_FILTER}")
 print(f"   ALLOWED_EVIDENCE_TYPES: {sorted(ALLOWED_EVIDENCE_TYPES) if ALLOWED_EVIDENCE_TYPES else 'all'}")
 print(f"   TASK_MATCH_COLUMN_CONFIG: {TASK_MATCH_COLUMN_CONFIG or '(missing)'}")
@@ -482,6 +506,78 @@ if GROUP_AWARE_SPLIT and not _group_aware_active:
 if _group_aware_active:
     filtered_rows.sort(key=lambda r: (str(r[_uuid_idx]), str(r[_task_idx])))
     print(f"✅ Sorted {len(filtered_rows)} rows by (UUID, {input_task_column}) for group-aware splitting.")
+
+# === Step 4c: Main-batch cut (sequential processing of very large uploads) ===
+# Runs once, before the normal Step 5 split. Cuts filtered_rows into N main batches —
+# written as their own filtered CSVs, NOT split_*.csv — which the service then feeds back
+# through this same script one at a time (with --skip-batch-cut) to get each batch's normal
+# fine-grained split_*.csv files. Skipped entirely for the per-batch sub-invocations.
+if MAIN_FILE_SPLIT and not ARGS.skip_batch_cut:
+    num_batches = math.ceil(len(filtered_rows) / MAIN_BATCH_ROWS_PER_BATCH) if filtered_rows else 0
+    if num_batches > MAX_MAIN_BATCHES:
+        print(f"⚠️  Natural batch count {num_batches} exceeds MAX_MAIN_BATCHES ({MAX_MAIN_BATCHES}) — "
+              f"capping batch count and growing effective batch size instead.")
+        num_batches = MAX_MAIN_BATCHES
+    effective_batch_rows = math.ceil(len(filtered_rows) / num_batches) if num_batches else len(filtered_rows)
+
+    # Same accumulator + group-boundary technique as the fine split below, just at the
+    # coarser main-batch grain — a (UUID, task) group must never span two main batches,
+    # otherwise it could also end up split across two DIFFERENT fine split files later.
+    if _group_aware_active:
+        batches = []
+        current = []
+        for j, r in enumerate(filtered_rows):
+            current.append(r)
+            at_target = len(current) >= effective_batch_rows
+            is_last = j == len(filtered_rows) - 1
+            this_key = (str(r[_uuid_idx]), str(r[_task_idx]))
+            next_key = None if is_last else (
+                str(filtered_rows[j + 1][_uuid_idx]), str(filtered_rows[j + 1][_task_idx])
+            )
+            at_boundary = is_last or next_key != this_key
+            if at_target and at_boundary:
+                batches.append(current)
+                current = []
+        if current:
+            batches.append(current)
+    else:
+        batches = [
+            filtered_rows[i * effective_batch_rows:(i + 1) * effective_batch_rows]
+            for i in range(math.ceil(len(filtered_rows) / effective_batch_rows))
+        ] if filtered_rows else []
+
+    padding_width = max(1, len(str(len(batches))))
+    actual_rows_written = 0
+    for i, batch in enumerate(batches):
+        batch_file = os.path.join(OUTPUT_DIR, f"filtered_batch_{str(i+1).zfill(padding_width)}.csv")
+        with open(batch_file, "w", newline='', encoding="utf-8") as outfile:
+            writer = csv.writer(outfile)
+            writer.writerow(final_header)
+            writer.writerows(batch)
+        actual_rows_written += len(batch)
+        print(f"✅ Created: {batch_file} ({len(batch)} rows)")
+        if _group_aware_active and len(batch) > 2 * effective_batch_rows:
+            print(f"⚠️  {os.path.basename(batch_file)} has {len(batch)} rows "
+                  f"(>2× target {effective_batch_rows}) — one (UUID, task) group is oversized.")
+
+    batch_manifest = {
+        "total_batches": len(batches),
+        "rows_per_batch_target": effective_batch_rows,
+        "total_rows": len(filtered_rows),
+        "actual_rows_written": actual_rows_written,
+        "group_aware": _group_aware_active,
+        "max_main_batches": MAX_MAIN_BATCHES,
+    }
+    with open(os.path.join(OUTPUT_DIR, "batch_manifest.json"), "w", encoding="utf-8") as mf:
+        json.dump(batch_manifest, mf, indent=2)
+
+    if actual_rows_written != len(filtered_rows):
+        print(f"⚠️  WARNING: Row count mismatch! Expected {len(filtered_rows)}, wrote {actual_rows_written}")
+    else:
+        print(f"✅ Validated: All {actual_rows_written} rows written across {len(batches)} main batches")
+    print(f"Mode: Main-batch cut into {len(batches)} batches (~{effective_batch_rows} rows each) — "
+          f"exiting before fine-grained split; each batch is split separately.")
+    exit()
 
 # === Step 5: Output - Single file or Multiple files based on configuration ===
 if SPLIT_FILES.lower() == "no":

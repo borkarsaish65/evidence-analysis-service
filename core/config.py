@@ -140,6 +140,14 @@ class Settings(BaseSettings):
     TARGET_ROWS_PER_SPLIT_MIN: int = 100  # Optimal range lower bound (lowered from 500)
     TARGET_ROWS_PER_SPLIT_MAX: int = 500  # Optimal range upper bound (lowered from 2000)
     OPTIMAL_ROWS_PER_SPLIT: int = 200  # Default target rows per split (lowered from 1000)
+
+    # Main-batch sequential processing (one level above the file splitting above): cuts a
+    # large upload into sequential main batches, each processed fully (including its own
+    # fine-grained split + parallel processing above) before the next one starts. Off by
+    # default — a single main batch (today's behavior) is byte-identical either way.
+    MAIN_FILE_SPLIT: bool = False  # "true" -> cut into main batches; "false" -> one main file
+    MAIN_BATCH_ROWS_PER_BATCH: int = 10000  # Target rows per main batch (count is derived)
+    MAX_MAIN_BATCHES: int = 200  # Hard cap on number of main batches
     
     # File Upload Limits
     MAX_UPLOAD_SIZE: int = 100 * 1024 * 1024  # 100MB

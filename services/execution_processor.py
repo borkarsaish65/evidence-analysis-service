@@ -61,6 +61,46 @@ class ExecutionWorkspace:
     final_output_csv: Path
     checkpoint_file: Path
     api_usage_log_file: Path
+    main_batches_dir: Path
+
+    def batch_paths(self, batch_index: int) -> "BatchWorkspace":
+        """Per-batch paths for main-file split processing (batch_index is 0-based).
+
+        Every path is batch-scoped — nothing is shared with other batches, mirroring the
+        sister repo's fully-independent per-main-split directories (separate INPUT_DIR/
+        OUTPUT_DIR per split, no shared checkpoint/log of any kind). This avoids any
+        collision risk by construction rather than relying on filenames staying unique.
+        Only used when MAIN_FILE_SPLIT is on — the off path never calls this.
+        """
+        suffix = f"batch_{batch_index:03d}"
+        preprocessor_output_dir = self.preprocessor_output_dir / suffix
+        processor_input_dir = self.processor_input_dir / suffix
+        processor_output_dir = self.processor_output_dir / suffix
+        preprocessor_output_dir.mkdir(parents=True, exist_ok=True)
+        processor_input_dir.mkdir(parents=True, exist_ok=True)
+        processor_output_dir.mkdir(parents=True, exist_ok=True)
+        return BatchWorkspace(
+            batch_index=batch_index,
+            filtered_batch_csv=self.main_batches_dir / f"filtered_{suffix}.csv",
+            preprocessor_output_dir=preprocessor_output_dir,
+            processor_input_dir=processor_input_dir,
+            processor_output_dir=processor_output_dir,
+            merged_output_csv=processor_output_dir / "merged_output.csv",
+            checkpoint_file=processor_output_dir / ".processing_checkpoint.json",
+            api_usage_log_file=processor_output_dir / "api_usage_log.csv",
+        )
+
+
+@dataclass
+class BatchWorkspace:
+    batch_index: int
+    filtered_batch_csv: Path
+    preprocessor_output_dir: Path
+    processor_input_dir: Path
+    processor_output_dir: Path
+    merged_output_csv: Path
+    checkpoint_file: Path
+    api_usage_log_file: Path
 
 
 def _run_async(coro):
@@ -269,11 +309,13 @@ def _build_workspace(execution_id: UUID) -> ExecutionWorkspace:
     preprocessor_output_dir = root_dir / "preprocessor_output"
     processor_input_dir = root_dir / "processor_input"
     processor_output_dir = root_dir / "processor_output"
+    main_batches_dir = root_dir / "main_batches"
 
     input_dir.mkdir(parents=True, exist_ok=True)
     preprocessor_output_dir.mkdir(parents=True, exist_ok=True)
     processor_input_dir.mkdir(parents=True, exist_ok=True)
     processor_output_dir.mkdir(parents=True, exist_ok=True)
+    main_batches_dir.mkdir(parents=True, exist_ok=True)
 
     return ExecutionWorkspace(
         root_dir=root_dir,
@@ -287,6 +329,7 @@ def _build_workspace(execution_id: UUID) -> ExecutionWorkspace:
         final_output_csv=processor_output_dir / "merged_output.csv",
         checkpoint_file=processor_output_dir / ".processing_checkpoint.json",
         api_usage_log_file=processor_output_dir / "api_usage_log.csv",
+        main_batches_dir=main_batches_dir,
     )
 
 
@@ -350,6 +393,31 @@ def _resolve_processor_columns_from_config(db: Session, execution: Execution) ->
         columns["question_text_column"] = question_text_column
 
     return columns
+
+
+def _concat_csv_files(source_files: list[Path], dest_file: Path) -> None:
+    """Concatenate multiple CSVs sharing the same header into one file (header written once).
+
+    Used to merge each main batch's already-complete output into the execution's single
+    final output, once every batch has finished. Assumes all source files share the same
+    header — true here since every batch's processor run writes the same merged-output
+    column set.
+    """
+    header_written = False
+    with open(dest_file, "w", newline="", encoding="utf-8") as out_f:
+        writer = None
+        for source_file in source_files:
+            with open(source_file, newline="", encoding="utf-8") as in_f:
+                reader = csv.reader(in_f)
+                header = next(reader, None)
+                if header is None:
+                    continue
+                if not header_written:
+                    writer = csv.writer(out_f)
+                    writer.writerow(header)
+                    header_written = True
+                for row in reader:
+                    writer.writerow(row)
 
 
 def _run_command(command: list[str], env: dict[str, str], label: str) -> None:
@@ -591,21 +659,6 @@ def process_execution(execution_id: str) -> dict[str, Any]:
         workspace.input_csv.write_bytes(input_bytes)
         workspace.questions_csv.write_bytes(questions_bytes)
 
-        # === Dynamic Splitting Logic ===
-        # Count rows in input file
-        logger.info(f"Analyzing input file for splitting strategy: {workspace.input_csv}")
-        row_count, is_estimate = _count_csv_rows(workspace.input_csv)
-        
-        # Calculate optimal splitting strategy
-        enable_split, num_splits, rows_per_file, strategy_name = _calculate_optimal_split_count(row_count)
-        
-        logger.info(
-            f"Splitting strategy selected: {strategy_name} | "
-            f"Input rows: {row_count:,}{' (estimated)' if is_estimate else ''} | "
-            f"Splits: {num_splits if enable_split else 1} | "
-            f"Rows per split: ~{rows_per_file}"
-        )
-
         preprocessor_script = _resolve_script_path(settings.PREPROCESS_SCRIPT_PATH)
         processor_script = _resolve_script_path(settings.PROCESSOR_SCRIPT_PATH)
 
@@ -636,68 +689,8 @@ def process_execution(execution_id: str) -> dict[str, Any]:
         evidence_types = processing_config.get(PROCESSING_CONFIG_KEY_EVIDENCE_TYPES)
         evidence_types = evidence_types if isinstance(evidence_types, list) and evidence_types else None
 
-        preprocessor_cmd = [
-            sys.executable,
-            str(preprocessor_script),
-            "--input-csv",
-            str(workspace.input_csv),
-            "--question-csv",
-            str(workspace.questions_csv),
-            "--output-dir",
-            str(workspace.preprocessor_output_dir),
-            "--split-files",
-            "yes" if enable_split else "no",
-        ]
-        
-        # Add rows-per-file parameter if splitting is enabled
-        if enable_split:
-            preprocessor_cmd.extend(["--rows-per-file", str(rows_per_file)])
-        
-        preprocessor_cmd.extend([
-            "--use-school-filter",
-            "false",
-        ])
-
-        if evidence_types:
-            preprocessor_cmd.extend(["--evidence-types", ",".join(evidence_types)])
-        if cap_enabled:
-            preprocessor_cmd.extend(["--max-relevant-per-user-task", str(max_relevant)])
-
-        _run_command(preprocessor_cmd, preprocessor_env, "Pre-processor script")
-
-        # Handle split files or single file based on strategy
-        if enable_split:
-            # Multiple split files expected
-            split_files = sorted(
-                workspace.preprocessor_output_dir.glob("split_*.csv"),
-                key=lambda p: p.name
-            )
-            
-            if not split_files:
-                raise ExecutionProcessingError(
-                    f"No split files found in {workspace.preprocessor_output_dir} after splitting enabled"
-                )
-            
-            logger.info(f"Found {len(split_files)} split files, copying to processor input directory")
-            
-            # Copy all split files to processor input directory
-            for split_file in split_files:
-                shutil.copy2(
-                    split_file,
-                    workspace.processor_input_dir / split_file.name,
-                )
-        else:
-            # Single file expected
-            if not workspace.preprocessed_csv.exists():
-                raise ExecutionProcessingError(
-                    f"Pre-processed file not found: {workspace.preprocessed_csv}"
-                )
-            
-            shutil.copy2(
-                workspace.preprocessed_csv,
-                workspace.processor_input_dir / "input.csv",
-            )
-
+        # processor_env is built here (not inside either branch below) because both the
+        # off-path and every per-batch run in the on-path need an identical copy of it.
         processor_env = {
             **base_env,
             "PYTHONUNBUFFERED": "1",
@@ -725,25 +718,244 @@ def process_execution(execution_id: str) -> dict[str, Any]:
                 max_relevant,
             )
 
-        processor_cmd = [
-            sys.executable,
-            str(processor_script),
-            "--input-dir",
-            str(workspace.processor_input_dir),
-            "--output-dir",
-            str(workspace.processor_output_dir),
-            "--final-output-file",
-            str(workspace.final_output_csv),
-            "--checkpoint-file",
-            str(workspace.checkpoint_file),
-            "--api-usage-log-file",
-            str(workspace.api_usage_log_file),
-            "--questions-file",
-            str(workspace.questions_csv),
-            "--max-processed-rows",
-            str(settings.PROCESSOR_MAX_ROWS),
-        ]
-        _run_command(processor_cmd, processor_env, "Processor script")
+        batch_api_usage_logs: list[Path] = []
+
+        if settings.MAIN_FILE_SPLIT:
+            # === Main-batch sequential processing ===
+            # Cut the whole input into main batches once, then run each one fully
+            # (fine-split + parallel processing, both unchanged) before starting the next.
+            batch_cut_cmd = [
+                sys.executable,
+                str(preprocessor_script),
+                "--input-csv",
+                str(workspace.input_csv),
+                "--question-csv",
+                str(workspace.questions_csv),
+                "--output-dir",
+                str(workspace.main_batches_dir),
+                "--main-batch-rows",
+                str(settings.MAIN_BATCH_ROWS_PER_BATCH),
+                "--max-main-batches",
+                str(settings.MAX_MAIN_BATCHES),
+            ]
+            if evidence_types:
+                batch_cut_cmd.extend(["--evidence-types", ",".join(evidence_types)])
+            if cap_enabled:
+                # Keep (UUID, task) groups within a single main batch so per-batch
+                # cap counts stay correct (mirrors group-aware fine-splitting below).
+                batch_cut_cmd.extend(["--max-relevant-per-user-task", str(max_relevant)])
+            batch_cut_env = {**preprocessor_env, "MAIN_FILE_SPLIT": "true"}
+            _run_command(batch_cut_cmd, batch_cut_env, "Pre-processor batch-cut")
+
+            batch_files = sorted(
+                workspace.main_batches_dir.glob("filtered_batch_*.csv"),
+                key=lambda p: p.name,
+            )
+            if not batch_files:
+                raise ExecutionProcessingError(
+                    f"MAIN_FILE_SPLIT is on but no main batch files were produced in "
+                    f"{workspace.main_batches_dir}"
+                )
+
+            logger.info(
+                "main_batch_split  execution=%s  total_batches=%d",
+                execution.id,
+                len(batch_files),
+            )
+
+            merged_batch_outputs: list[Path] = []
+            for batch_index, batch_csv in enumerate(batch_files):
+                bw = workspace.batch_paths(batch_index)
+                label = f"batch {batch_index + 1}/{len(batch_files)}"
+                batch_api_usage_logs.append(bw.api_usage_log_file)
+
+                if bw.merged_output_csv.exists():
+                    logger.info("main_batch_already_completed  execution=%s  %s", execution.id, label)
+                    merged_batch_outputs.append(bw.merged_output_csv)
+                    continue
+
+                logger.info("main_batch_started  execution=%s  %s", execution.id, label)
+
+                batch_row_count, batch_is_estimate = _count_csv_rows(batch_csv)
+                batch_enable_split, _num_splits, batch_rows_per_file, batch_strategy = (
+                    _calculate_optimal_split_count(batch_row_count)
+                )
+                logger.info(
+                    "batch_split_strategy  execution=%s  %s  strategy=%s  rows=%d%s  rows_per_split=~%d",
+                    execution.id,
+                    label,
+                    batch_strategy,
+                    batch_row_count,
+                    " (estimated)" if batch_is_estimate else "",
+                    batch_rows_per_file,
+                )
+
+                batch_preprocessor_cmd = [
+                    sys.executable,
+                    str(preprocessor_script),
+                    "--input-csv",
+                    str(batch_csv),
+                    "--question-csv",
+                    str(workspace.questions_csv),
+                    "--output-dir",
+                    str(bw.preprocessor_output_dir),
+                    "--split-files",
+                    "yes" if batch_enable_split else "no",
+                ]
+                if batch_enable_split:
+                    batch_preprocessor_cmd.extend(["--rows-per-file", str(batch_rows_per_file)])
+                batch_preprocessor_cmd.extend(["--use-school-filter", "false", "--skip-batch-cut"])
+                if evidence_types:
+                    batch_preprocessor_cmd.extend(["--evidence-types", ",".join(evidence_types)])
+                if cap_enabled:
+                    batch_preprocessor_cmd.extend(["--max-relevant-per-user-task", str(max_relevant)])
+                _run_command(batch_preprocessor_cmd, preprocessor_env, f"Pre-processor script ({label})")
+
+                if batch_enable_split:
+                    batch_split_files = sorted(
+                        bw.preprocessor_output_dir.glob("split_*.csv"),
+                        key=lambda p: p.name,
+                    )
+                    if not batch_split_files:
+                        raise ExecutionProcessingError(
+                            f"No split files found in {bw.preprocessor_output_dir} after splitting "
+                            f"enabled ({label})"
+                        )
+                    for split_file in batch_split_files:
+                        shutil.copy2(split_file, bw.processor_input_dir / split_file.name)
+                else:
+                    batch_preprocessed_csv = bw.preprocessor_output_dir / "preprocessed_data.csv"
+                    if not batch_preprocessed_csv.exists():
+                        raise ExecutionProcessingError(
+                            f"Pre-processed file not found: {batch_preprocessed_csv} ({label})"
+                        )
+                    shutil.copy2(batch_preprocessed_csv, bw.processor_input_dir / "input.csv")
+
+                batch_processor_cmd = [
+                    sys.executable,
+                    str(processor_script),
+                    "--input-dir",
+                    str(bw.processor_input_dir),
+                    "--output-dir",
+                    str(bw.processor_output_dir),
+                    "--final-output-file",
+                    str(bw.merged_output_csv),
+                    "--checkpoint-file",
+                    str(bw.checkpoint_file),
+                    "--api-usage-log-file",
+                    str(bw.api_usage_log_file),
+                    "--questions-file",
+                    str(workspace.questions_csv),
+                    "--max-processed-rows",
+                    str(settings.PROCESSOR_MAX_ROWS),
+                ]
+                _run_command(batch_processor_cmd, processor_env, f"Processor script ({label})")
+
+                if not bw.merged_output_csv.exists():
+                    raise ExecutionProcessingError(
+                        f"Merged output file not found: {bw.merged_output_csv} ({label})"
+                    )
+
+                logger.info("main_batch_completed  execution=%s  %s", execution.id, label)
+                merged_batch_outputs.append(bw.merged_output_csv)
+
+            _concat_csv_files(merged_batch_outputs, workspace.final_output_csv)
+        else:
+            # === Single main file — today's exact existing behavior, unchanged ===
+            logger.info(f"Analyzing input file for splitting strategy: {workspace.input_csv}")
+            row_count, is_estimate = _count_csv_rows(workspace.input_csv)
+
+            enable_split, num_splits, rows_per_file, strategy_name = _calculate_optimal_split_count(row_count)
+
+            logger.info(
+                f"Splitting strategy selected: {strategy_name} | "
+                f"Input rows: {row_count:,}{' (estimated)' if is_estimate else ''} | "
+                f"Splits: {num_splits if enable_split else 1} | "
+                f"Rows per split: ~{rows_per_file}"
+            )
+
+            preprocessor_cmd = [
+                sys.executable,
+                str(preprocessor_script),
+                "--input-csv",
+                str(workspace.input_csv),
+                "--question-csv",
+                str(workspace.questions_csv),
+                "--output-dir",
+                str(workspace.preprocessor_output_dir),
+                "--split-files",
+                "yes" if enable_split else "no",
+            ]
+
+            # Add rows-per-file parameter if splitting is enabled
+            if enable_split:
+                preprocessor_cmd.extend(["--rows-per-file", str(rows_per_file)])
+
+            preprocessor_cmd.extend([
+                "--use-school-filter",
+                "false",
+            ])
+            if evidence_types:
+                preprocessor_cmd.extend(["--evidence-types", ",".join(evidence_types)])
+            if cap_enabled:
+                preprocessor_cmd.extend(["--max-relevant-per-user-task", str(max_relevant)])
+
+            _run_command(preprocessor_cmd, preprocessor_env, "Pre-processor script")
+
+            # Handle split files or single file based on strategy
+            if enable_split:
+                # Multiple split files expected
+                split_files = sorted(
+                    workspace.preprocessor_output_dir.glob("split_*.csv"),
+                    key=lambda p: p.name
+                )
+
+                if not split_files:
+                    raise ExecutionProcessingError(
+                        f"No split files found in {workspace.preprocessor_output_dir} after splitting enabled"
+                    )
+
+                logger.info(f"Found {len(split_files)} split files, copying to processor input directory")
+
+                # Copy all split files to processor input directory
+                for split_file in split_files:
+                    shutil.copy2(
+                        split_file,
+                        workspace.processor_input_dir / split_file.name,
+                    )
+            else:
+                # Single file expected
+                if not workspace.preprocessed_csv.exists():
+                    raise ExecutionProcessingError(
+                        f"Pre-processed file not found: {workspace.preprocessed_csv}"
+                    )
+
+                shutil.copy2(
+                    workspace.preprocessed_csv,
+                    workspace.processor_input_dir / "input.csv",
+                )
+
+            processor_cmd = [
+                sys.executable,
+                str(processor_script),
+                "--input-dir",
+                str(workspace.processor_input_dir),
+                "--output-dir",
+                str(workspace.processor_output_dir),
+                "--final-output-file",
+                str(workspace.final_output_csv),
+                "--checkpoint-file",
+                str(workspace.checkpoint_file),
+                "--api-usage-log-file",
+                str(workspace.api_usage_log_file),
+                "--questions-file",
+                str(workspace.questions_csv),
+                "--max-processed-rows",
+                str(settings.PROCESSOR_MAX_ROWS),
+            ]
+            _run_command(processor_cmd, processor_env, "Processor script")
+
+            batch_api_usage_logs.append(workspace.api_usage_log_file)
 
         if not workspace.final_output_csv.exists():
             raise ExecutionProcessingError(
@@ -809,7 +1021,16 @@ def process_execution(execution_id: str) -> dict[str, Any]:
         )
 
         elapsed_seconds = (datetime.utcnow() - start_ts).total_seconds()
-        actual_cost = _read_actual_cost_from_log(workspace.api_usage_log_file)
+        # batch_api_usage_logs has exactly one entry (workspace.api_usage_log_file) when
+        # MAIN_FILE_SPLIT is off, or one entry per completed batch when it's on — each
+        # batch logs its own cost independently (no shared log across batches), so the
+        # execution's total cost is the sum across whichever logs actually exist.
+        batch_costs = [
+            cost
+            for log_path in batch_api_usage_logs
+            if (cost := _read_actual_cost_from_log(log_path)) is not None
+        ]
+        actual_cost = sum(batch_costs) if batch_costs else None
         _mark_execution_completed(
             execution.id,
             output_file_url=uploaded_output_path,
