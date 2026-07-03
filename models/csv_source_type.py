@@ -60,6 +60,7 @@ class CsvSourceType(Base):
     # Sample file URLs
     sample_input_file_url = Column(Text, nullable=True)
     sample_criteria_file_url = Column(Text, nullable=True)
+    sample_school_filter_file_url = Column(Text, nullable=True)
 
     # Status and audit
     is_active = Column(Boolean, nullable=False, server_default=text("true"))

@@ -49,6 +49,8 @@ class Execution(Base):
     criterias_file_size = Column(BigInteger, nullable=True)
     output_file_url = Column(Text, nullable=True)
     output_file_size = Column(BigInteger, nullable=True)
+    school_filter_file_url = Column(Text, nullable=True)
+    school_filter_file_size = Column(BigInteger, nullable=True)
     
     # Processing metadata (Phase 1 additions)
     worker_id = Column(String(100), nullable=True)

@@ -50,3 +50,9 @@ RELEVANCE_TYPES = {
 
 # processing_config JSONB key for the evidence-type filter.
 PROCESSING_CONFIG_KEY_EVIDENCE_TYPES = "evidence_types"
+
+# Required header in an uploaded school-filter CSV. The pre-processor script
+# (scripts/pre-processor/1-pre-processor.py) reads this exact column name via
+# csv.DictReader; the service validates it up front so a filter that would match
+# nothing is rejected at upload instead of silently dropping every row.
+SCHOOL_FILTER_REQUIRED_COLUMN = "UDISE+ SCHOOL CODE"

@@ -128,10 +128,10 @@ class ConfigService:
             HTTPException: If type not found or sample URL not configured
         """
         # Validate file_type parameter
-        if file_type not in ("input", "criteria"):
+        if file_type not in ("input", "criteria", "school_filter"):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid file_type. Must be 'input' or 'criteria'.",
+                detail="Invalid file_type. Must be 'input', 'criteria', or 'school_filter'.",
             )
 
         tenant_code, organization_code = self._resolve_scope(current_user)
@@ -155,11 +155,12 @@ class ConfigService:
             )
         
         # Get the appropriate sample URL
-        sample_url = (
-            source_type.sample_input_file_url
-            if file_type == "input"
-            else source_type.sample_criteria_file_url
-        )
+        _sample_url_by_type = {
+            "input": source_type.sample_input_file_url,
+            "criteria": source_type.sample_criteria_file_url,
+            "school_filter": source_type.sample_school_filter_file_url,
+        }
+        sample_url = _sample_url_by_type[file_type]
         
         if not sample_url:
             raise HTTPException(

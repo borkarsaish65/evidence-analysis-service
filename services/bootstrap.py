@@ -57,6 +57,14 @@ _SAMPLE_UPLOADS: list[dict] = [
         "db_field": "sample_criteria_file_url",
         "label": "sample_criteria",
     },
+    {
+        "local_path": (
+            _PROJECT_ROOT / "public" / "sample-csv" / "projects" / "sample_school_filter.csv"
+        ),
+        "cloud_path": "projects/sample_school_filter.csv",
+        "db_field": "sample_school_filter_file_url",
+        "label": "sample_school_filter",
+    },
 ]
 
 

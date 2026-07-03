@@ -57,6 +57,7 @@ class ExecutionWorkspace:
     processor_output_dir: Path
     input_csv: Path
     questions_csv: Path
+    school_filter_csv: Path
     preprocessed_csv: Path
     final_output_csv: Path
     checkpoint_file: Path
@@ -325,6 +326,7 @@ def _build_workspace(execution_id: UUID) -> ExecutionWorkspace:
         processor_output_dir=processor_output_dir,
         input_csv=input_dir / "input.csv",
         questions_csv=input_dir / "question.csv",
+        school_filter_csv=input_dir / "school_filter.csv",
         preprocessed_csv=preprocessor_output_dir / "preprocessed_data.csv",
         final_output_csv=processor_output_dir / "merged_output.csv",
         checkpoint_file=processor_output_dir / ".processing_checkpoint.json",
@@ -659,6 +661,12 @@ def process_execution(execution_id: str) -> dict[str, Any]:
         workspace.input_csv.write_bytes(input_bytes)
         workspace.questions_csv.write_bytes(questions_bytes)
 
+        if execution.school_filter_file_url and execution.school_filter_file_size:
+            school_filter_bytes = _run_async(storage_service.download_file(execution.school_filter_file_url))
+            if not school_filter_bytes:
+                raise ExecutionProcessingError("School filter file could not be downloaded from storage.")
+            workspace.school_filter_csv.write_bytes(school_filter_bytes)
+
         preprocessor_script = _resolve_script_path(settings.PREPROCESS_SCRIPT_PATH)
         processor_script = _resolve_script_path(settings.PROCESSOR_SCRIPT_PATH)
 
@@ -688,6 +696,10 @@ def process_execution(execution_id: str) -> dict[str, Any]:
         processing_config = execution.processing_config if isinstance(execution.processing_config, dict) else {}
         evidence_types = processing_config.get(PROCESSING_CONFIG_KEY_EVIDENCE_TYPES)
         evidence_types = evidence_types if isinstance(evidence_types, list) and evidence_types else None
+
+        school_filter_active = bool(
+            execution.school_filter_file_url and execution.school_filter_file_size
+        )
 
         # processor_env is built here (not inside either branch below) because both the
         # off-path and every per-batch run in the on-path need an identical copy of it.
@@ -740,6 +752,11 @@ def process_execution(execution_id: str) -> dict[str, Any]:
             ]
             if evidence_types:
                 batch_cut_cmd.extend(["--evidence-types", ",".join(evidence_types)])
+            if school_filter_active:
+                batch_cut_cmd.extend([
+                    "--filter-csv", str(workspace.school_filter_csv),
+                    "--use-school-filter", "true",
+                ])
             if cap_enabled:
                 # Keep (UUID, task) groups within a single main batch so per-batch
                 # cap counts stay correct (mirrors group-aware fine-splitting below).
@@ -804,7 +821,14 @@ def process_execution(execution_id: str) -> dict[str, Any]:
                 ]
                 if batch_enable_split:
                     batch_preprocessor_cmd.extend(["--rows-per-file", str(batch_rows_per_file)])
-                batch_preprocessor_cmd.extend(["--use-school-filter", "false", "--skip-batch-cut"])
+                batch_preprocessor_cmd.append("--skip-batch-cut")
+                if school_filter_active:
+                    batch_preprocessor_cmd.extend([
+                        "--filter-csv", str(workspace.school_filter_csv),
+                        "--use-school-filter", "true",
+                    ])
+                else:
+                    batch_preprocessor_cmd.extend(["--use-school-filter", "false"])
                 if evidence_types:
                     batch_preprocessor_cmd.extend(["--evidence-types", ",".join(evidence_types)])
                 if cap_enabled:
@@ -891,10 +915,13 @@ def process_execution(execution_id: str) -> dict[str, Any]:
             if enable_split:
                 preprocessor_cmd.extend(["--rows-per-file", str(rows_per_file)])
 
-            preprocessor_cmd.extend([
-                "--use-school-filter",
-                "false",
-            ])
+            if school_filter_active:
+                preprocessor_cmd.extend([
+                    "--filter-csv", str(workspace.school_filter_csv),
+                    "--use-school-filter", "true",
+                ])
+            else:
+                preprocessor_cmd.extend(["--use-school-filter", "false"])
             if evidence_types:
                 preprocessor_cmd.extend(["--evidence-types", ",".join(evidence_types)])
             if cap_enabled:

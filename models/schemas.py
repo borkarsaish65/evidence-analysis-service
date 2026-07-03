@@ -292,6 +292,8 @@ class ExecutionDetail(ExecutionResponse):
     input_file_size: Optional[int] = None
     criterias_file_size: Optional[int] = None
     output_file_size: Optional[int] = None
+    school_filter_file_url: Optional[str] = None
+    school_filter_file_size: Optional[int] = None
     upload_completed_at: Optional[datetime] = None
     checkpoint_data: Optional[Dict[str, Any]] = None
     input_file_status: Optional[ExecutionFileCheckpointState] = None
