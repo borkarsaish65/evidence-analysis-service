@@ -30,6 +30,7 @@ class Execution(Base):
     criterias_file_url = Column(Text, nullable=True)
     criterias_config = Column(JSONB, nullable=True)
     threshold_config = Column(JSONB, nullable=True)
+    processing_config = Column(JSONB, nullable=True)  # generic per-execution processing options, e.g. {"evidence_types": [...]}
     
     # Status and processing
     status = Column(String(50), nullable=False, default='queued', index=True)  # queued, in_progress, completed, failed

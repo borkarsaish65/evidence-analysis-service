@@ -23,6 +23,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from core.config import settings
+from core.constants import ALLOWED_EVIDENCE_TYPES, PROCESSING_CONFIG_KEY_EVIDENCE_TYPES
 from models.csv_source_type import CsvSourceType
 from models.execution import Execution
 from models.schemas import (
@@ -30,6 +31,7 @@ from models.schemas import (
     CloudDownloadableUrlResponse,
     CloudSignedUrlRequest,
     CloudSignedUrlResponse,
+    ExecutionCreate,
     ExecutionCreateRequest,
     ExecutionDetail,
     ExecutionFileCheckpointState,
@@ -343,6 +345,28 @@ class ExecutionService:
                 if value:
                     return value
         return None
+
+    @staticmethod
+    def _allowed_evidence_type_keys(source_type: CsvSourceType) -> list[str]:
+        evidence_types_config = source_type.evidence_types_config
+        if not isinstance(evidence_types_config, list) or not evidence_types_config:
+            return sorted(ALLOWED_EVIDENCE_TYPES)
+        return sorted({str(item.get("key", "")).strip() for item in evidence_types_config if item.get("key")})
+
+    @staticmethod
+    def _resolve_processing_config(
+        request_data: ExecutionCreate, source_type: CsvSourceType
+    ) -> dict[str, Any]:
+        """Build the processing_config JSONB payload. evidence_types is required and already
+        guaranteed to be a non-empty list by ExecutionCreate's Pydantic validator."""
+        allowed = ExecutionService._allowed_evidence_type_keys(source_type)
+        invalid = [t for t in request_data.evidence_types if t not in allowed]
+        if invalid:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"evidence_types must be a subset of {allowed}, got invalid: {invalid}",
+            )
+        return {PROCESSING_CONFIG_KEY_EVIDENCE_TYPES: request_data.evidence_types}
 
     @staticmethod
     def _build_estimates(row_count: int) -> tuple[Optional[Decimal], Optional[int]]:
@@ -960,6 +984,7 @@ class ExecutionService:
             if request_data.evidence_threshold is not None
             else None
         )
+        processing_config = self._resolve_processing_config(request_data, source_type)
 
         execution = Execution(
             tenant_code=tenant_code,
@@ -972,6 +997,7 @@ class ExecutionService:
             states=request_data.states or [],
             criterias_mode=criterias_mode,
             threshold_config=threshold_config,
+            processing_config=processing_config,
             status="draft",
             created_by=current_user.id,
             checkpoint_data={"files": {"input": {}, "questions": {}}},
@@ -1655,6 +1681,7 @@ class ExecutionService:
             if request_data.evidence_threshold is not None
             else None
         )
+        processing_config = self._resolve_processing_config(request_data, source_type)
 
         execution = Execution(
             tenant_code=tenant_code,
@@ -1667,6 +1694,7 @@ class ExecutionService:
             states=request_data.states or [],
             criterias_mode=criterias_mode,
             threshold_config=threshold_config,
+            processing_config=processing_config,
             status="draft",
             created_by=current_user.id,
             input_file_size=request_data.input_file.size_bytes,
@@ -1899,6 +1927,7 @@ class ExecutionService:
                 "criterias_mode": execution.criterias_mode,
                 "criterias_config": execution.criterias_config,
                 "threshold_config": execution.threshold_config,
+                "processing_config": execution.processing_config,
                 "actual_cost": self._to_float(execution.actual_cost),
                 "estimated_cost": self._to_float(execution.estimated_cost),
                 "input_file_size": execution.input_file_size,
@@ -2144,6 +2173,7 @@ class ExecutionService:
             'states',
             'program_ref_id',
             'program_name',
+            PROCESSING_CONFIG_KEY_EVIDENCE_TYPES,
         }
 
         for field in allowed_fields:
@@ -2166,6 +2196,39 @@ class ExecutionService:
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail="states must be a non-empty array if provided."
                     )
+
+            if field == PROCESSING_CONFIG_KEY_EVIDENCE_TYPES:
+                # evidence_types doesn't live on the ORM model directly — it rides inside the
+                # generic processing_config JSONB blob, merged so other future keys survive.
+                # Required field: clearing it to empty/null would silently put the execution
+                # back into "no restriction", so that's rejected rather than allowed.
+                if not value:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="evidence_types cannot be cleared; provide a non-empty list of allowed types.",
+                    )
+                current_processing_config = (
+                    dict(execution.processing_config) if isinstance(execution.processing_config, dict) else {}
+                )
+                source_type = self._get_csv_source_type(
+                    tenant_code=execution.tenant_code,
+                    organization_code=execution.organization_code,
+                    type_key=execution.csv_type_id or "",
+                )
+                allowed = (
+                    self._allowed_evidence_type_keys(source_type)
+                    if source_type
+                    else sorted(ALLOWED_EVIDENCE_TYPES)
+                )
+                invalid = [t for t in value if t not in allowed]
+                if invalid:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"evidence_types must be a subset of {allowed}, got invalid: {invalid}",
+                    )
+                current_processing_config[PROCESSING_CONFIG_KEY_EVIDENCE_TYPES] = value
+                execution.processing_config = current_processing_config
+                continue
 
             # Optional fields support explicit clears via null.
             setattr(execution, field, value)

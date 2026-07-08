@@ -79,13 +79,47 @@ class ConfigService:
         """
         List config entries for the requested type.
         Supported contract:
-        - type=project -> project CSV source types (type_key=project_report).
+        - type=project        -> project CSV source types (type_key=project_report).
+        - type=evidence_type  -> allowed evidence types for the evidence-type filter.
         """
         normalized_type = (config_type or "").strip().lower()
+        if normalized_type == "evidence_type":
+            tenant_code, organization_code = self._resolve_scope(current_user)
+            source_type = (
+                self.db.query(CsvSourceType)
+                .filter(
+                    CsvSourceType.tenant_code == tenant_code,
+                    CsvSourceType.organization_code == organization_code,
+                    CsvSourceType.is_active.is_(True),
+                    CsvSourceType.type_key == "project_report",
+                )
+                .first()
+            )
+            if not source_type:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="No active project_report CSV source type configured for this tenant/organization.",
+                )
+            if not isinstance(source_type.evidence_types_config, list) or not source_type.evidence_types_config:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="evidence_types_config is not configured for this tenant's CSV source type.",
+                )
+            evidence_types_config = source_type.evidence_types_config
+            # extensions are an internal detail for the pre-processor/processor scripts —
+            # the public config contract only ever exposed {key, label}. evidence_types_config
+            # is tenant-controlled JSONB; malformed entries (manual DB edits, bad defaults)
+            # are skipped rather than raising a 500 on missing key/label.
+            return [
+                {"key": item["key"], "label": item["label"]}
+                for item in evidence_types_config
+                if isinstance(item, dict) and item.get("key") and item.get("label")
+            ]
+
         if normalized_type != "project":
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Unsupported config type. Use type=project.",
+                detail="Unsupported config type. Use type=project or type=evidence_type.",
             )
 
         tenant_code, organization_code = self._resolve_scope(current_user)

@@ -11,6 +11,7 @@ import typing_extensions as typing
 import time
 import mimetypes
 import unicodedata
+import random
 from urllib.request import urlopen
 import re
 import logging
@@ -24,18 +25,21 @@ load_dotenv(dotenv_path=SERVICE_ROOT / ".env")
 # Allow importing from the service package (services/, core/, etc.)
 if str(SERVICE_ROOT) not in sys.path:
     sys.path.insert(0, str(SERVICE_ROOT))
-from core.constants import PROVIDER_GEMINI, PROVIDER_OPENROUTER, OPENROUTER_MODELS_URL, RELEVANCE_TAG_NOT_VALIDATED
+from core.constants import (
+    PROVIDER_GEMINI,
+    PROVIDER_OPENROUTER,
+    OPENROUTER_MODELS_URL,
+    RELEVANCE_TAG_RELEVANT,
+    RELEVANCE_TAG_PARTIAL,
+    RELEVANCE_TAG_IRRELEVANT,
+    RELEVANCE_TAG_NOT_VALIDATED,
+    EVIDENCE_TYPE_EXTENSIONS as DEFAULT_EVIDENCE_TYPE_EXTENSIONS,
+)
 from utils.llm_provider import generate_content, _looks_like_placeholder
 import threading
 import time
 from collections import deque
 import hashlib
-
-# === Constants ===
-IMAGE_FORMATS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
-PDF_FORMATS = {".pdf"}
-EXCEL_FORMATS = {".xlsx", ".xls"}
-ALL_VALID_FORMATS = IMAGE_FORMATS | PDF_FORMATS | EXCEL_FORMATS
 
 
 def _parse_args():
@@ -61,10 +65,32 @@ def _parse_args():
         default=None,
         help="Per-(UUID, task) relevant-evidence cap; unset means no cap",
     )
+    parser.add_argument(
+        "--evidence-types-to-validate",
+        default=None,
+        help="JSON object mapping evidence type key -> list of file extensions "
+        "(per-tenant, from CsvSourceType.evidence_types_config); absent = core.constants default",
+    )
     return parser.parse_args()
 
 
 ARGS = _parse_args()
+
+# === Constants ===
+# Per-tenant type->extension map, passed in by execution_processor.py from
+# CsvSourceType.evidence_types_config; falls back to the core.constants default when this
+# script is run standalone (no execution context to resolve tenant config from).
+if ARGS.evidence_types_to_validate:
+    EVIDENCE_TYPE_EXTENSIONS = {
+        str(key): [str(ext).lower() for ext in exts]
+        for key, exts in json.loads(ARGS.evidence_types_to_validate).items()
+    }
+else:
+    EVIDENCE_TYPE_EXTENSIONS = DEFAULT_EVIDENCE_TYPE_EXTENSIONS
+
+# Only IMAGE_FORMATS remains: used for Image Preview rendering. get_evidence_type()
+# resolves types dynamically from EVIDENCE_TYPE_EXTENSIONS directly (see below).
+IMAGE_FORMATS = set(EVIDENCE_TYPE_EXTENSIONS.get("image", []))
 
 MAX_PROCESSED_ROWS = (
     ARGS.max_processed_rows
@@ -297,13 +323,6 @@ def _resolve_model_pricing(model_name):
             logger.warning("gemini_pricing_not_found  model=%s", model_name)
         return pricing
 
-# Retriable-error markers for the token-rotation retry handlers below.
-_RETRY_ERROR_MARKERS = ["rate limit", "quota", "429", "resource_exhausted"]
-if _LLM_PROVIDER_NAME == PROVIDER_OPENROUTER:
-    _RETRY_ERROR_MARKERS = _RETRY_ERROR_MARKERS + ["401", "unauthorized", "user not found"]
-elif _LLM_PROVIDER_NAME == PROVIDER_GEMINI:
-    pass  # Gemini uses the base markers above
-
 
 
 # ===== CHECKPOINT MANAGEMENT FUNCTIONS =====
@@ -453,7 +472,7 @@ def _read_resume_state(output_dir, input_filename, worker_id, identity_col="UUID
                 if url and url.lower() not in ("nan", "null", "none", ""):
                     processed_keys.add((ident, task, url))
         if {"UUID", INPUT_TASK_COLUMN, "Relevance Tag"}.issubset(df.columns):
-            rel_rows = df[df["Relevance Tag"] == "Relevant"]
+            rel_rows = df[df["Relevance Tag"] == RELEVANCE_TAG_RELEVANT]
             for _, r in rel_rows.iterrows():
                 key = (str(r["UUID"]).strip(), str(r[INPUT_TASK_COLUMN]).strip())
                 relevant_count_dict[key] = relevant_count_dict.get(key, 0) + 1
@@ -988,6 +1007,9 @@ def _ensure_required_qa_fields(response_json, expected_questions=1):
 current_llm_token_index = 0
 llm_token_rotation_lock = threading.Lock()
 
+_dead_tokens: set[str] = set()
+_dead_tokens_lock = threading.Lock()
+
 def get_next_llm_token():
     global current_llm_token_index
     with llm_token_rotation_lock:
@@ -1009,6 +1031,19 @@ def switch_to_next_llm_token():
         logging.info("[LLM] Using token: -----")
         return token
 
+def _mark_token_dead(token: str):
+    with _dead_tokens_lock:
+        _dead_tokens.add(token)
+    logging.error("[LLM] token=***** marked_dead  removing from rotation")
+
+def get_worker_token(worker_id: int) -> str:
+    with _dead_tokens_lock:
+        active = [t for t in _LLM_TOKENS if t not in _dead_tokens]
+    if not active:
+        logging.error("[LLM] all_tokens_dead  falling back to last configured token")
+        return _LLM_TOKENS[-1]
+    return active[(worker_id - 1) % len(active)]
+
 
 # === Gemini Model Setup ===
 class AnalysisResponse(typing.TypedDict):
@@ -1026,10 +1061,10 @@ if not _LLM_TOKENS:
     raise ValueError(f"[{_LLM_PROVIDER_NAME}] No valid tokens found!")
 
 
-def _llm_generate(parts):
+def _llm_generate(parts, token=None):
     return generate_content(
         parts,
-        api_key=get_next_llm_token(),
+        api_key=token or get_next_llm_token(),
         model_name=LLM_MODEL_NAME,
         generation_config=_build_generation_config(),
     )
@@ -1275,11 +1310,11 @@ def calculate_relevance_tag(answers, mode=None, question_text=None, reasonings=N
         str: 'Relevant', 'Partially Relevant', or 'Irrelevant'
     """
     if not answers or not isinstance(answers, list):
-        return 'Irrelevant'
+        return RELEVANCE_TAG_IRRELEVANT
 
     total_answers = len(answers)
     if total_answers == 0:
-        return 'Irrelevant'
+        return RELEVANCE_TAG_IRRELEVANT
 
     # Use global mode if not specified
     if mode is None:
@@ -1424,47 +1459,56 @@ def calculate_relevance_tag(answers, mode=None, question_text=None, reasonings=N
 
     # Determine relevance tag based on combined score and configurable thresholds
     if combined_score >= RELEVANT_THRESHOLD:
-        tag = 'Relevant'
+        tag = RELEVANCE_TAG_RELEVANT
     elif combined_score >= PARTIALLY_RELEVANT_THRESHOLD:
-        tag = 'Partially Relevant'
+        tag = RELEVANCE_TAG_PARTIAL
     else:
-        tag = 'Irrelevant'
+        tag = RELEVANCE_TAG_IRRELEVANT
     
     logging.debug(f"[Relevance-{mode.upper()}] Final score: {combined_score:.2f} → Tag: {tag}")
     return tag
 
-# Track timestamps of recent requests
-_request_times = deque()
-_request_lock = threading.Lock()
-MAX_REQUESTS_PER_MINUTE = 2000
+MAX_RPM_PER_TOKEN = max(1, int(os.getenv("MAX_RPM_PER_TOKEN", "4000")))
 
-def rate_limiter():
-    """Block until we are under the 2000 req/min limit."""
-    global _request_times
-    with _request_lock:
-        now = time.time()
-        # Remove requests older than 60 seconds
-        while _request_times and now - _request_times[0] > 60:
-            _request_times.popleft()
+_token_buckets: dict[str, deque] = {}
+_token_locks: dict[str, threading.Lock] = {}
+_buckets_init_lock = threading.Lock()
 
-        if len(_request_times) >= MAX_REQUESTS_PER_MINUTE:
-            sleep_time = 60 - (now - _request_times[0])
-            if sleep_time > 0:
-                logging.info(f"[RateLimiter] Throttling for {sleep_time:.2f} seconds to stay under 2000 req/min...")
-                time.sleep(sleep_time)
-                return rate_limiter()  # Recheck after sleep
+def _ensure_bucket(token: str):
+    if token not in _token_buckets:
+        with _buckets_init_lock:
+            if token not in _token_buckets:          # double-checked under lock
+                _token_locks[token]   = threading.Lock()  # lock first — outer guard checks _token_buckets
+                _token_buckets[token] = deque()
 
-        _request_times.append(time.time())
+def rate_limiter(token: str):
+    """Block until this specific token is under MAX_RPM_PER_TOKEN. Lock released during sleep."""
+    _ensure_bucket(token)
+    lock = _token_locks[token]
+    dq   = _token_buckets[token]
+    while True:
+        with lock:
+            now = time.time()
+            while dq and now - dq[0] > 60:
+                dq.popleft()
+            if len(dq) < MAX_RPM_PER_TOKEN:
+                dq.append(now)
+                return
+            sleep_time = 61.0 - (now - dq[0])
+        if sleep_time > 0:
+            jitter = random.uniform(0, 3)
+            logging.info("[RateLimiter] token=***** throttled %.1fs (+%.1fs jitter)", sleep_time, jitter)
+            time.sleep(sleep_time + jitter)
 
 
 def process_image(task_evidence_link, task_evidence_question, task_name=None, max_retries=3,
                   worker_id=None, input_file=None, row_number=None, school_id=None):
-    global current_token_index
     retries = 0
+    worker_token = get_worker_token(worker_id) if worker_id is not None else get_next_llm_token()
     expected_questions = _estimate_question_count(task_evidence_question)
     while retries < max_retries:
         try:
-            rate_limiter()
+            rate_limiter(worker_token)
             image = httpx.get(task_evidence_link)
 
             # Check if this is an enrollment-related task (normalize both sides)
@@ -1626,7 +1670,7 @@ CORRECT JSON Response:
             response = _llm_generate([
                 {"mime_type": "image/jpeg", "data": base64.b64encode(image.content).decode("utf-8")},
                 prompt,
-            ])
+            ], token=worker_token)
             response_json = _ensure_required_qa_fields(
                 _parse_model_json_response(getattr(response, "text", "")),
                 expected_questions=expected_questions,
@@ -1650,14 +1694,23 @@ CORRECT JSON Response:
             return response_json
         except Exception as e:
             error_str = str(e).lower()
-            if any(k in error_str for k in _RETRY_ERROR_MARKERS):
-                logging.warning("[Gemini] Rate limit or quota exceeded. Switching token...")
-                if switch_to_next_llm_token():
-                    continue
-                else:
-                    logging.warning("[Gemini] No more tokens. Retrying in 60 seconds...")
-                    time.sleep(60)
-                    retries += 1
+            if any(k in error_str for k in ["rate limit", "quota", "429", "resource_exhausted"]):
+                wait = min(60 * (2 ** retries), 300)
+                logging.warning("[LLM] rate_limit_hit  worker=%s  attempt=%d  backoff=%ds  error=%s",
+                                worker_id, retries + 1, wait, str(e)[:120])
+                time.sleep(wait)
+                retries += 1
+            elif any(k in error_str for k in ["401", "unauthorized", "user not found"]):
+                logging.error("[LLM] unauthorized  worker=%s  token=*****  marking_dead  error=%s",
+                              worker_id, str(e)[:120])
+                _mark_token_dead(worker_token)
+                with _dead_tokens_lock:
+                    all_dead = len(_dead_tokens) >= len(_LLM_TOKENS)
+                if all_dead:
+                    logging.error("[LLM] all_tokens_dead  worker=%s  aborting", worker_id)
+                    break
+                worker_token = get_worker_token(worker_id) if worker_id is not None else get_next_llm_token()
+                retries += 1
             else:
                 logging.error(f"[Gemini] Error: {e}")
                 retries += 1
@@ -1667,17 +1720,16 @@ CORRECT JSON Response:
 
 # === Helper function to determine evidence type ===
 def get_evidence_type(url):
-    """Determine evidence type from URL. Returns: 'image', 'pdf', 'excel', or None"""
+    """Determine the evidence type from URL by matching its extension against the
+    configured EVIDENCE_TYPE_EXTENSIONS map — mirrors the pre-processor's resolver so a
+    tenant-custom type (any key beyond image/pdf/excel) is recognized consistently instead
+    of silently resolving to None here while the pre-processor already let the row through.
+    Returns the type key (e.g. 'image', 'pdf', 'excel', or any tenant-configured key), or
+    None if no extension matched."""
     url = str(url).strip().lower()
-    for ext in IMAGE_FORMATS:
-        if url.endswith(ext):
-            return "image"
-    for ext in PDF_FORMATS:
-        if url.endswith(ext):
-            return "pdf"
-    for ext in EXCEL_FORMATS:
-        if url.endswith(ext):
-            return "excel"
+    for type_key, extensions in EVIDENCE_TYPE_EXTENSIONS.items():
+        if any(url.endswith(ext) for ext in extensions):
+            return type_key
     return None
 
 
@@ -1730,12 +1782,12 @@ You are analyzing an ENROLLMENT REPORT. You MUST extract THREE DIFFERENT numeric
 def process_pdf(task_evidence_link, task_evidence_question, task_name=None, max_retries=3,
                 worker_id=None, input_file=None, row_number=None, school_id=None):
     """Process PDF evidence using Gemini API with usage tracking"""
-    global current_token_index
     retries = 0
+    worker_token = get_worker_token(worker_id) if worker_id is not None else get_next_llm_token()
     expected_questions = _estimate_question_count(task_evidence_question)
     while retries < max_retries:
         try:
-            rate_limiter()
+            rate_limiter(worker_token)
             # Download PDF
             pdf_response = httpx.get(task_evidence_link)
             pdf_data = pdf_response.content
@@ -1809,7 +1861,7 @@ Focus on:
             response = _llm_generate([
                 {"mime_type": "application/pdf", "data": base64.b64encode(pdf_data).decode("utf-8")},
                 prompt,
-            ])
+            ], token=worker_token)
             response_json = _ensure_required_qa_fields(
                 _parse_model_json_response(getattr(response, "text", "")),
                 expected_questions=expected_questions,
@@ -1833,14 +1885,23 @@ Focus on:
             return response_json
         except Exception as e:
             error_str = str(e).lower()
-            if any(k in error_str for k in _RETRY_ERROR_MARKERS):
-                logging.warning("[Gemini] Rate limit or quota exceeded. Switching token...")
-                if switch_to_next_llm_token():
-                    continue
-                else:
-                    logging.warning("[Gemini] No more tokens. Retrying in 60 seconds...")
-                    time.sleep(60)
-                    retries += 1
+            if any(k in error_str for k in ["rate limit", "quota", "429", "resource_exhausted"]):
+                wait = min(60 * (2 ** retries), 300)
+                logging.warning("[LLM] rate_limit_hit  worker=%s  attempt=%d  backoff=%ds  error=%s",
+                                worker_id, retries + 1, wait, str(e)[:120])
+                time.sleep(wait)
+                retries += 1
+            elif any(k in error_str for k in ["401", "unauthorized", "user not found"]):
+                logging.error("[LLM] unauthorized  worker=%s  token=*****  marking_dead  error=%s",
+                              worker_id, str(e)[:120])
+                _mark_token_dead(worker_token)
+                with _dead_tokens_lock:
+                    all_dead = len(_dead_tokens) >= len(_LLM_TOKENS)
+                if all_dead:
+                    logging.error("[LLM] all_tokens_dead  worker=%s  aborting", worker_id)
+                    break
+                worker_token = get_worker_token(worker_id) if worker_id is not None else get_next_llm_token()
+                retries += 1
             else:
                 logging.error(f"[Gemini] PDF processing error: {e}")
                 retries += 1
@@ -1851,12 +1912,12 @@ Focus on:
 def process_excel(task_evidence_link, task_evidence_question, task_name=None, max_retries=3,
                   worker_id=None, input_file=None, row_number=None, school_id=None):
     """Process Excel evidence - download and convert to text for Gemini with usage tracking"""
-    global current_token_index
     retries = 0
+    worker_token = get_worker_token(worker_id) if worker_id is not None else get_next_llm_token()
     expected_questions = _estimate_question_count(task_evidence_question)
     while retries < max_retries:
         try:
-            rate_limiter()
+            rate_limiter(worker_token)
             # Download Excel file
             excel_response = httpx.get(task_evidence_link)
             
@@ -1936,7 +1997,7 @@ Focus on:
 - Educational context"""
                 prompt += ENROLLMENT_PROMPT_SUFFIX
             
-            response = _llm_generate([prompt])
+            response = _llm_generate([prompt], token=worker_token)
             response_json = _ensure_required_qa_fields(
                 _parse_model_json_response(getattr(response, "text", "")),
                 expected_questions=expected_questions,
@@ -1960,14 +2021,23 @@ Focus on:
             return response_json
         except Exception as e:
             error_str = str(e).lower()
-            if any(k in error_str for k in _RETRY_ERROR_MARKERS):
-                logging.warning("[Gemini] Rate limit or quota exceeded. Switching token...")
-                if switch_to_next_llm_token():
-                    continue
-                else:
-                    logging.warning("[Gemini] No more tokens. Retrying in 60 seconds...")
-                    time.sleep(60)
-                    retries += 1
+            if any(k in error_str for k in ["rate limit", "quota", "429", "resource_exhausted"]):
+                wait = min(60 * (2 ** retries), 300)
+                logging.warning("[LLM] rate_limit_hit  worker=%s  attempt=%d  backoff=%ds  error=%s",
+                                worker_id, retries + 1, wait, str(e)[:120])
+                time.sleep(wait)
+                retries += 1
+            elif any(k in error_str for k in ["401", "unauthorized", "user not found"]):
+                logging.error("[LLM] unauthorized  worker=%s  token=*****  marking_dead  error=%s",
+                              worker_id, str(e)[:120])
+                _mark_token_dead(worker_token)
+                with _dead_tokens_lock:
+                    all_dead = len(_dead_tokens) >= len(_LLM_TOKENS)
+                if all_dead:
+                    logging.error("[LLM] all_tokens_dead  worker=%s  aborting", worker_id)
+                    break
+                worker_token = get_worker_token(worker_id) if worker_id is not None else get_next_llm_token()
+                retries += 1
             else:
                 logging.error(f"[Gemini] Excel processing error: {e}")
                 retries += 1
@@ -2150,6 +2220,14 @@ def main(input_file, worker_id=None, checkpoint_data=None):
             is_relevant_limit_enabled = False
         relevant_count_per_key = dict(resume_relevant_counts) if is_relevant_limit_enabled else {}
         not_validated_count = 0
+        # AI success = the AI returned a usable response (Relevant/Partial/Irrelevant all
+        # count — a real verdict, not a failure). AI failure = no usable response at all
+        # (see the "Invalid response" branch below). Counted directly at the point each
+        # outcome is known, same as the other per-row counters here.
+        ai_success_count = 0
+        ai_failure_count = 0
+        success_list = []
+        failed_list = []
         if is_relevant_limit_enabled and relevant_count_per_key:
             logging.info(f"[Worker {worker_id}] [Resume] Restored Relevant counts for {len(relevant_count_per_key)} (UUID, task) groups from output CSV")
         if is_relevant_limit_enabled:
@@ -2284,7 +2362,9 @@ def main(input_file, worker_id=None, checkpoint_data=None):
 
             task_types.append("User-Owned" if is_user_owned else "Standard")
 
-            # Determine evidence type and route to appropriate processor
+            # Determine evidence type and route to appropriate processor.
+            # Evidence-type filtering is enforced upstream by the pre-processor — rows with
+            # a disallowed evidence_type are dropped there and never reach this script.
             evidence_type = get_evidence_type(task_evidence)
             if evidence_type:
                 logging.info(f"[Worker {worker_id}] Processing {evidence_type} {'user-owned' if is_user_owned else 'standard'} task row {idx+1}/{len(df_filtered)}")
@@ -2321,10 +2401,12 @@ def main(input_file, worker_id=None, checkpoint_data=None):
                         reasonings=reasonings,
                     )
                     relevance_tags.append(relevance_tag)
+                    ai_success_count += 1
+                    success_list.append(task_evidence)
 
                     # Count this Relevant hit toward the per-(UUID, task) cap so later rows
                     # of the same pair are capped once the limit is reached.
-                    if relevant_evidence_cap_key and relevance_tag == "Relevant":
+                    if relevant_evidence_cap_key and relevance_tag == RELEVANCE_TAG_RELEVANT:
                         relevant_count_per_key[relevant_evidence_cap_key] = relevant_count_per_key.get(relevant_evidence_cap_key, 0) + 1
 
                     # ===== CHECKPOINT: Mark row as processed =====
@@ -2392,18 +2474,15 @@ def main(input_file, worker_id=None, checkpoint_data=None):
                     logging.warning(f"[Worker {worker_id}] Invalid response at row {idx+1}")
                     task_evidence_qa.append(None)
                     task_evidence_qa_reason.append(None)
-                    relevance_tags.append('Irrelevant')
+                    relevance_tags.append(RELEVANCE_TAG_IRRELEVANT)
                     task_types[-1] = "Failed"  # Update the last task type
+                    ai_failure_count += 1
+                    failed_list.append(task_evidence)
                     for key in EXTRA_KEYS.keys():
                         extra_keys_data[key].append(None)
-            else:
-                logging.info(f"[Worker {worker_id}] Skipping unsupported evidence type at row {idx+1}")
-                task_evidence_qa.append(None)
-                task_evidence_qa_reason.append(None)
-                relevance_tags.append('Irrelevant')
-                task_types.append("Unsupported")
-                for key in EXTRA_KEYS.keys():
-                    extra_keys_data[key].append(None)
+            # No final else: the pre-processor's Rule 3 already drops any row whose evidence
+            # type can't be resolved at all, so evidence_type is never falsy here for rows
+            # reaching this point through the normal pre-processor -> processor pipeline.
 
             processed_count += 1
 
@@ -2467,6 +2546,16 @@ def main(input_file, worker_id=None, checkpoint_data=None):
         )
         df_to_save = df_filtered  # already written to CSV; used only for stats below
 
+        # ===== SAFETY NET: ensure the output file exists even when nothing was ever flushed =====
+        # _flush_to_csv is only called from inside the per-row loop above, so if every row was
+        # excluded before reaching it (e.g. an evidence-type filter leaves 0 rows for this split),
+        # output_filename is never created and the Main merge step's pd.read_csv(f) crashes with
+        # FileNotFoundError. df_to_save always has the right columns even with 0 rows, so writing
+        # it here (header-only in that case) keeps the merge step working unconditionally.
+        if not os.path.exists(output_filename):
+            df_to_save.to_csv(output_filename, index=False)
+            logging.info(f"[Worker {worker_id}] No rows reached the flush step — wrote header-only output: {output_filename}")
+
         # Separate user-owned tasks for reporting
         user_owned_df = df_to_save[df_to_save["Task Type"] == "User-Owned"]
         if not user_owned_df.empty:
@@ -2478,13 +2567,12 @@ def main(input_file, worker_id=None, checkpoint_data=None):
                 "user_owned_file": user_owned_filename,
                 "rows_attempted": processed_count,
                 "api_calls": rows_processed_new,  # Only count new API calls
-                # notValidated rows (relevant-cap reached, or evidence-type excluded) made no
-                # API call — exclude them from success/failure so these stay scoped to rows
-                # actually sent to the AI.
-                "api_successes": sum(1 for tag in df_to_save["Relevance Tag"] if tag not in ('Irrelevant', RELEVANCE_TAG_NOT_VALIDATED)),
-                "api_failures": sum(1 for tag in df_to_save["Relevance Tag"] if tag == 'Irrelevant'),
-                "success_list": [task_evidence for task_evidence, tag in zip(df_to_save["Task Evidence"], df_to_save["Relevance Tag"]) if tag not in ('Irrelevant', RELEVANCE_TAG_NOT_VALIDATED)],
-                "failed_list": [task_evidence for task_evidence, tag in zip(df_to_save["Task Evidence"], df_to_save["Relevance Tag"]) if tag == 'Irrelevant'],
+                # notValidated rows (relevant-cap reached) made no API call — exclude them
+                # from success/failure so these stay scoped to rows actually sent to the AI.
+                "api_successes": ai_success_count,
+                "api_failures": ai_failure_count,
+                "success_list": success_list,
+                "failed_list": failed_list,
                 "user_owned_count": len(user_owned_df),
                 "standard_count": len(df_to_save) - len(user_owned_df),
                 "checkpoint_skipped": rows_skipped_from_checkpoint,
@@ -2496,13 +2584,12 @@ def main(input_file, worker_id=None, checkpoint_data=None):
                 "output_file": output_filename,
                 "rows_attempted": processed_count,
                 "api_calls": rows_processed_new,  # Only count new API calls
-                # notValidated rows (relevant-cap reached, or evidence-type excluded) made no
-                # API call — exclude them from success/failure so these stay scoped to rows
-                # actually sent to the AI.
-                "api_successes": sum(1 for tag in df_to_save["Relevance Tag"] if tag not in ('Irrelevant', RELEVANCE_TAG_NOT_VALIDATED)),
-                "api_failures": sum(1 for tag in df_to_save["Relevance Tag"] if tag == 'Irrelevant'),
-                "success_list": [task_evidence for task_evidence, tag in zip(df_to_save["Task Evidence"], df_to_save["Relevance Tag"]) if tag not in ('Irrelevant', RELEVANCE_TAG_NOT_VALIDATED)],
-                "failed_list": [task_evidence for task_evidence, tag in zip(df_to_save["Task Evidence"], df_to_save["Relevance Tag"]) if tag == 'Irrelevant'],
+                # notValidated rows (relevant-cap reached) made no API call — exclude them
+                # from success/failure so these stay scoped to rows actually sent to the AI.
+                "api_successes": ai_success_count,
+                "api_failures": ai_failure_count,
+                "success_list": success_list,
+                "failed_list": failed_list,
                 "user_owned_count": 0,
                 "standard_count": len(df_to_save),
                 "checkpoint_skipped": rows_skipped_from_checkpoint,
@@ -2764,14 +2851,14 @@ if __name__ == "__main__":
         
         logging.info(f"Total Rows Processed (sum of attempts): {total_rows_processed_all}")
         logging.info(f"Total Image Rows Processed: {total_api_calls_all}")
-        logging.info(f"  - ✅ Relevant / Partially Relevant: {total_api_success_all}")
-        logging.info(f"  - ⬜ Irrelevant: {total_api_failure_all}")
+        logging.info(f"  - ✅ AI responded (Relevant/Partial/Irrelevant): {total_api_success_all}")
+        logging.info(f"  - ⬜ Failed (no usable AI response): {total_api_failure_all}")
         if total_not_validated_all > 0:
             logging.info(f"  - 🚫 notValidated (relevant cap reached, no API call): {total_not_validated_all}")
         
         # Checkpoint statistics
         logging.info("")
-        logging.info(f"===== CHECKPOINT STATISTICS =====")
+        logging.info("===== CHECKPOINT STATISTICS =====")
         logging.info(f"Rows skipped (from checkpoint): {total_checkpoint_skipped_all}")
         logging.info(f"New API calls made: {total_checkpoint_new_all}")
         logging.info(f"API calls saved: {total_checkpoint_skipped_all}")
@@ -2836,18 +2923,18 @@ if __name__ == "__main__":
         logging.info(f"  - Total Tasks: {total_standard_count + total_user_owned_count}")
 
         if all_failed_lists:
-            logging.warning(f"List of Irrelevant Evidence URLs ({len(all_failed_lists)}):")
+            logging.warning(f"List of Evidence URLs with No Usable AI Response ({len(all_failed_lists)}):")
             for item in all_failed_lists:
                 logging.warning(f"  - {item}")
         else:
-            logging.info("✅ No irrelevant evidence recorded.")
+            logging.info("✅ No failed AI responses recorded.")
 
         if all_success_lists:
-            logging.info(f"List of Relevant / Partially Relevant Evidence URLs ({len(all_success_lists)}):")
+            logging.info(f"List of Evidence URLs the AI Responded To ({len(all_success_lists)}):")
             for item in all_success_lists:
                 logging.info(f"  - {item}")
         else:
-            logging.info("No relevant evidence recorded.")
+            logging.info("No AI responses recorded.")
             
         logging.info("="*80)
         logging.info("===== 🏁 END OF SUMMARY =====")

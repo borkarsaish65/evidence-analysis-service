@@ -7,6 +7,11 @@ from datetime import datetime
 from uuid import UUID
 
 from core.config import settings
+from core.constants import (
+    RELEVANCE_TAG_RELEVANT,
+    RELEVANCE_TAG_PARTIAL,
+    RELEVANCE_TAG_IRRELEVANT,
+)
 
 
 # ============ Authentication Schemas ============
@@ -76,6 +81,10 @@ class ExecutionCreate(BaseModel):
     program_ref_id: Optional[str] = None
     program_name: Optional[str] = None
     states: Optional[List[str]] = None
+    # Required: an execution must always declare which evidence types to process, so a
+    # lost/omitted filter fails loud at request time instead of silently processing every
+    # evidence type through the paid AI unnoticed.
+    evidence_types: List[str] = Field(..., min_length=1)
     # Per-(user, task) relevant-evidence cap. When set, the AI stops validating a
     # user's task once this many evidences are tagged "Relevant"; the rest are written
     # as "notValidated" with no API call. Omitted/None = feature off (current behavior).
@@ -92,6 +101,19 @@ class ExecutionCreate(BaseModel):
         if len(v) > 0 and not cleaned:
             raise ValueError("states must contain at least one non-empty string")
         return cleaned or None
+
+    @field_validator("evidence_types", mode="before")
+    @classmethod
+    def validate_evidence_types(cls, v: Any) -> List[str]:
+        # Normalization only. The allowed set is tenant-specific (CsvSourceType.evidence_types_config)
+        # and DB access isn't available at the Pydantic layer, so the subset check happens in
+        # ExecutionService._resolve_processing_config instead.
+        if not isinstance(v, list) or not v:
+            raise ValueError("evidence_types is required and must be a non-empty array of strings")
+        cleaned = sorted({str(t).strip().lower() for t in v if str(t).strip()})
+        if not cleaned:
+            raise ValueError("evidence_types is required and must be a non-empty array of strings")
+        return cleaned
 
 
 class FileUploadDescriptor(BaseModel):
@@ -198,6 +220,7 @@ class ExecutionUpdate(BaseModel):
     failure_reason: Optional[str] = None
     processed_rows: Optional[int] = None
     total_rows: Optional[int] = None
+    evidence_types: Optional[List[str]] = None
 
     @field_validator("states", mode="before")
     @classmethod
@@ -209,6 +232,19 @@ class ExecutionUpdate(BaseModel):
         cleaned = [str(s).strip() for s in v if str(s).strip()]
         if len(v) > 0 and not cleaned:
             raise ValueError("states must contain at least one non-empty string")
+        return cleaned or None
+
+    @field_validator("evidence_types", mode="before")
+    @classmethod
+    def validate_evidence_types(cls, v: Any) -> Optional[List[str]]:
+        # Normalization only. The allowed set is tenant-specific (CsvSourceType.evidence_types_config)
+        # and DB access isn't available at the Pydantic layer, so the subset check happens in
+        # ExecutionService._resolve_processing_config instead.
+        if v is None:
+            return None
+        if not isinstance(v, list):
+            raise ValueError("evidence_types must be an array of strings")
+        cleaned = sorted({str(t).strip().lower() for t in v if str(t).strip()})
         return cleaned or None
 
 
@@ -250,6 +286,7 @@ class ExecutionDetail(ExecutionResponse):
     criterias_mode: Optional[str] = None
     criterias_config: Optional[Dict[str, Any]] = None
     threshold_config: Optional[Dict[str, Any]] = None
+    processing_config: Optional[Dict[str, Any]] = None
     input_file_size: Optional[int] = None
     criterias_file_size: Optional[int] = None
     output_file_size: Optional[int] = None
@@ -335,7 +372,7 @@ class CriteriaValidationResponse(BaseModel):
     """Response schema for criteria validation."""
     source: Literal["gemini", "openrouter"]
     model: str
-    relevance_tag: Literal["Relevant", "Partially Relevant", "Irrelevant"]
+    relevance_tag: Literal[RELEVANCE_TAG_RELEVANT, RELEVANCE_TAG_PARTIAL, RELEVANCE_TAG_IRRELEVANT]
     criteria_results: list[CriteriaValidationItem]
     answers: list[str]
     reasonings: list[str]

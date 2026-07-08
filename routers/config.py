@@ -29,9 +29,9 @@ logger = logging.getLogger(__name__)
 async def list(
     config_service: ConfigServiceDep,
     current_user: UserResponse = Depends(AuthService.get_current_user),
-    type: Literal["project"] = Query(...),
+    type: Literal["project", "evidence_type"] = Query(...),
 ):
-    """List config values by type. Current support: type=project."""
+    """List config values by type. Supported: type=project, type=evidence_type."""
     try:
         items = config_service.list(type, current_user)
         payload = StandardAPIResponse(
