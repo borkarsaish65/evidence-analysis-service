@@ -14,6 +14,13 @@ from pathlib import Path
 env_path = Path(__file__).parent.parent / '.env'
 load_dotenv(dotenv_path=env_path)
 
+# Allow importing from the service package (core/, etc.) — mirrors 1-main-parallel-script.py
+SERVICE_ROOT = Path(__file__).resolve().parents[2]
+if str(SERVICE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SERVICE_ROOT))
+from core.constants import EVIDENCE_TYPE_EXTENSIONS as DEFAULT_EVIDENCE_TYPE_EXTENSIONS
+from core.constants import SCHOOL_FILTER_REQUIRED_COLUMN as DEFAULT_SCHOOL_FILTER_REQUIRED_COLUMN
+
 def str2bool(val):
     return str(val).lower() in ("1", "true", "yes")
 
@@ -31,6 +38,23 @@ def _parse_args():
     parser.add_argument("--split-files", default=None, choices=["yes", "no"], help="Split output files or not")
     parser.add_argument("--rows-per-file", default=None, type=int, help="Rows per split file")
     parser.add_argument("--use-school-filter", default=None, help="Enable school filtering (true/false)")
+    parser.add_argument(
+        "--school-filter-column",
+        default=None,
+        help="Required column name in the school-filter CSV (per-tenant, from "
+        "CsvSourceType.school_filter_config); absent = core.constants default",
+    )
+    parser.add_argument(
+        "--evidence-types",
+        default=None,
+        help="Comma list of allowed evidence types (image,pdf,excel); required",
+    )
+    parser.add_argument(
+        "--evidence-types-to-validate",
+        default=None,
+        help="JSON object mapping evidence type key -> list of file extensions "
+        "(per-tenant, from CsvSourceType.evidence_types_config); absent = core.constants default",
+    )
     parser.add_argument("--max-relevant-per-user-task", default=None, type=int, help="Per-(UUID, task) relevant-evidence cap; enables group-aware splitting when set")
     return parser.parse_args()
 
@@ -58,6 +82,20 @@ use_school_filter_value = (
     else os.getenv("PREPROCESS_USE_SCHOOL_FILTER", os.getenv("USE_SCHOOL_FILTER", False))
 )
 USE_SCHOOL_FILTER = str2bool(use_school_filter_value)  # Set True to filter by school_list.csv
+# Per-tenant required column name for the school-filter CSV, passed in by
+# execution_processor.py from CsvSourceType.school_filter_config.
+if ARGS.school_filter_column:
+    SCHOOL_FILTER_COLUMN = ARGS.school_filter_column
+
+if not ARGS.evidence_types:
+    print("ERROR: --evidence-types is required but was empty.")
+    sys.exit(1)
+ALLOWED_EVIDENCE_TYPES = {
+    t.strip().lower() for t in ARGS.evidence_types.split(",") if t.strip()
+}
+if not ALLOWED_EVIDENCE_TYPES:
+    print("ERROR: --evidence-types is required but was empty.")
+    sys.exit(1)
 
 # === SPLIT CONFIGURATION ===
 SPLIT_FILES = ARGS.split_files or os.getenv("PREPROCESS_SPLIT_FILES") or os.getenv("SPLIT_FILES", "yes")
@@ -70,21 +108,28 @@ ROWS_PER_FILE = ARGS.rows_per_file or int(os.getenv("PREPROCESS_ROWS_PER_FILE", 
 GROUP_AWARE_SPLIT = ARGS.max_relevant_per_user_task is not None
 
 # Debug: Print loaded configuration
-print(f"🔧 Configuration Loaded:")
+print("🔧 Configuration Loaded:")
 print(f"   SPLIT_FILES: {SPLIT_FILES}")
 print(f"   ROWS_PER_FILE: {ROWS_PER_FILE}")
 print(f"   GROUP_AWARE_SPLIT: {GROUP_AWARE_SPLIT}")
 print(f"   USE_SCHOOL_FILTER: {USE_SCHOOL_FILTER}")
+print(f"   ALLOWED_EVIDENCE_TYPES: {sorted(ALLOWED_EVIDENCE_TYPES)}")
 print(f"   TASK_MATCH_COLUMN_CONFIG: {TASK_MATCH_COLUMN_CONFIG or '(missing)'}")
 print(f"   QUESTION_TASK_COLUMN_FALLBACK: {DEFAULT_QUESTION_TASK_COLUMN}")
 print(f"   INPUT_TASK_COLUMN_FALLBACK: {DEFAULT_INPUT_TASK_COLUMN}")
 print()
 
 # === EVIDENCE FORMATS ===
-IMAGE_FORMATS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
-PDF_FORMATS = {".pdf"}
-EXCEL_FORMATS = {".xlsx", ".xls"}
-ALL_VALID_FORMATS = IMAGE_FORMATS | PDF_FORMATS | EXCEL_FORMATS
+# Per-tenant type->extension map, passed in by execution_processor.py from
+# CsvSourceType.evidence_types_config; falls back to the core.constants default when this
+# script is run standalone (no execution context to resolve tenant config from).
+if ARGS.evidence_types_to_validate:
+    EVIDENCE_TYPE_EXTENSIONS = {
+        str(key): [str(ext).lower() for ext in exts]
+        for key, exts in json.loads(ARGS.evidence_types_to_validate).items()
+    }
+else:
+    EVIDENCE_TYPE_EXTENSIONS = DEFAULT_EVIDENCE_TYPE_EXTENSIONS
 
 # Create output directory
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -94,6 +139,7 @@ skip_task_not_in_questions = 0
 skip_evidence_null = 0
 skip_school_mismatch = 0
 skip_invalid_evidence = 0  # Renamed from skip_non_image to handle all invalid evidence types
+skip_evidence_type_excluded = 0  # Evidence type valid but not in ALLOWED_EVIDENCE_TYPES
 total_input_rows = 0 # This will be set correctly below
 
 # === Step 1: Load FILTER_CSV school codes into a set ===
@@ -102,7 +148,7 @@ if USE_SCHOOL_FILTER and os.path.exists(FILTER_CSV):
     with open(FILTER_CSV, newline='', encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            school_code = row.get("UDISE+ SCHOOL CODE", "").strip()
+            school_code = row.get(SCHOOL_FILTER_COLUMN, "").strip()
             if school_code:
                 valid_school_codes.add(school_code)
     print(f"✅ Loaded {len(valid_school_codes)} school codes from '{FILTER_CSV}'")
@@ -278,23 +324,19 @@ def normalize_task_name(name):
 
 # === Helper function to determine evidence type ===
 def get_evidence_type(url):
-    """Determine the evidence type from URL. Returns: 'image', 'pdf', 'excel', or None"""
+    """Determine the evidence type from URL by matching its extension against the
+    configured EVIDENCE_TYPE_EXTENSIONS map. Returns the type key (e.g. 'image', 'pdf',
+    'excel', or any tenant-configured key), or None if no extension matched."""
     url = clean_cell(url) # Clean the URL string first for *checking*
     if not url or url.lower() == "null":
         return None
     try:
         parsed = urlparse(url)
         path = parsed.path.lower()
-        for ext in IMAGE_FORMATS:
-            if path.endswith(ext):
-                return "image"
-        for ext in PDF_FORMATS:
-            if path.endswith(ext):
-                return "pdf"
-        for ext in EXCEL_FORMATS:
-            if path.endswith(ext):
-                return "excel"
-    except:
+        for type_key, extensions in EVIDENCE_TYPE_EXTENSIONS.items():
+            if any(path.endswith(ext) for ext in extensions):
+                return type_key
+    except Exception:
         pass
     return None
 
@@ -430,6 +472,11 @@ for row in tqdm(all_rows, total=total_input_rows, desc="Processing input CSV"):
         skip_invalid_evidence += 1
         continue
 
+    # Rule 3b: Skip if evidence type is valid but excluded by the execution's evidence-type filter
+    if evidence_type not in ALLOWED_EVIDENCE_TYPES:
+        skip_evidence_type_excluded += 1
+        continue
+
     # === Step 4: Fill additional columns & Clean District ===
     # _q already resolved above in Rule 1 — reuse directly.
     row["Task Evidence Question"] = _q
@@ -542,7 +589,7 @@ else:
         actual_rows_written += len(chunk)
         print(f"✅ Created: {output_file} (rows {rows_before+1}-{rows_before+len(chunk)}, {len(chunk)} rows)")
         if _group_aware_active and len(chunk) > 2 * ROWS_PER_FILE:
-            print(f"⚠️  {os.path.basename(output_file)} has {len(chunk)} rows (>2× target {ROWS_PER_FILE}) — one (UUID, task) group is oversized.")
+            print(f"⚠️  {os.path.basename(output_file)} has {len(chunk)} rows (>2x target {ROWS_PER_FILE}) — one (UUID, task) group is oversized.")
         rows_before += len(chunk)
 
     # Create split manifest
@@ -590,6 +637,9 @@ print(f"{'Task Evidence empty or null':<50} {skip_evidence_null:<10} {remaining_
 
 remaining_after_invalid = remaining_after_evidence - skip_invalid_evidence
 print(f"{'Task Evidence is not valid (not image/pdf/excel)':<50} {skip_invalid_evidence:<10} {remaining_after_invalid}")
+
+remaining_after_type_excluded = remaining_after_invalid - skip_evidence_type_excluded
+print(f"{'Evidence type excluded by execution filter':<50} {skip_evidence_type_excluded:<10} {remaining_after_type_excluded}")
 
 print(f"\n{'='*70}")
 print(f"Final output CSV rows: {len(filtered_rows)}")

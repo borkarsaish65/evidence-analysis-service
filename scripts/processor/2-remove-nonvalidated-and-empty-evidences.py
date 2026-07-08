@@ -4,11 +4,10 @@ Standalone cleanup script: removes rows with no AI-evaluation result from a proc
 A row ends up with an empty 'Task evidence Q and A' / 'Task evidence Q and A Reason' when the
 processor never got a usable AI answer for it — see 1-main-parallel-script.py's skip paths: no
 question found for the task ("User-Owned"), the relevant-evidence cap was reached ("Capped",
-tag=notValidated), the AI response was invalid ("Failed"), or the evidence type was unsupported
-("Unsupported"). notValidated rows are identified explicitly by the Relevance Tag column; blank
-Q&A catches the remaining skip paths (Failed/Unsupported/User-Owned) that carry no tag. Both
-conditions are checked and counted separately so the summary shows how many rows were capped
-vs how many had other missing data.
+tag=notValidated), or the AI response was invalid ("Failed"). notValidated rows are identified
+explicitly by the Relevance Tag column; blank Q&A catches the remaining skip paths
+(Failed/User-Owned) that carry no tag. Both conditions are checked and counted separately so
+the summary shows how many rows were capped vs how many had other missing data.
 
 Usage:
     python scripts/processor/2-remove-nonvalidated-and-empty-evidences.py \
@@ -19,11 +18,18 @@ import argparse
 import csv
 import os
 import re
+import sys
+from pathlib import Path
+
+# Allow importing from the service package (core/, etc.) — mirrors 1-main-parallel-script.py
+SERVICE_ROOT = Path(__file__).resolve().parents[2]
+if str(SERVICE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SERVICE_ROOT))
+from core.constants import RELEVANCE_TAG_NOT_VALIDATED
 
 CHECK_COLUMNS = ("Task evidence Q and A", "Task evidence Q and A Reason")
 URL_COLUMN = "Task Evidence"
 RELEVANCE_TAG_COLUMN = "Relevance Tag"
-NOT_VALIDATED_TAG = "notValidated"
 URL_PATTERN = re.compile(r'https?://[^\s<>"{}|\\^`\[\]]+')
 
 
@@ -36,16 +42,18 @@ def _parse_args():
     return parser.parse_args()
 
 
-def remove_not_validated(input_csv: str, output_csv: str) -> tuple[int, int, int, list[str]]:
+def remove_not_validated(input_csv: str, output_csv: str) -> tuple[int, int, int, int]:
     """Write input_csv to output_csv with invalid rows removed.
 
     A row is invalid if its Relevance Tag is 'notValidated' (relevant-evidence cap reached)
-    or if either Q&A column is blank (Failed/Unsupported/User-Owned skip paths).
+    or if either Q&A column is blank (Failed/User-Owned skip paths).
 
-    Returns (total_rows, removed_rows, not_validated_count, extracted_urls):
+    Returns (total_rows, removed_rows, not_validated_count, extracted_url_count):
       - not_validated_count: rows explicitly tagged notValidated
       - removed_rows: all removed rows (notValidated + blank-Q&A)
-      - extracted_urls: Task Evidence values from removed rows
+      - extracted_url_count: count of Task Evidence values from removed rows — the values
+        themselves are never logged (may carry cloud-storage signed-URL tokens); the
+        uploaded unfiltered CSV is the audit trail for what was actually removed.
     """
     output_dir = os.path.dirname(output_csv)
     if output_dir:
@@ -54,7 +62,7 @@ def remove_not_validated(input_csv: str, output_csv: str) -> tuple[int, int, int
     total = 0
     removed = 0
     not_validated_count = 0
-    extracted_urls: list[str] = []
+    extracted_url_count = 0
     with open(input_csv, newline="", encoding="utf-8") as infile:
         reader = csv.DictReader(infile)
         if not reader.fieldnames:
@@ -68,7 +76,7 @@ def remove_not_validated(input_csv: str, output_csv: str) -> tuple[int, int, int
             writer.writeheader()
             for row in reader:
                 total += 1
-                is_not_validated = (row.get(RELEVANCE_TAG_COLUMN) or "").strip() == NOT_VALIDATED_TAG
+                is_not_validated = (row.get(RELEVANCE_TAG_COLUMN) or "").strip() == RELEVANCE_TAG_NOT_VALIDATED
                 is_blank_qa = any(not (row.get(col) or "").strip() for col in CHECK_COLUMNS)
                 is_invalid = is_not_validated or is_blank_qa
                 if is_invalid:
@@ -78,18 +86,18 @@ def remove_not_validated(input_csv: str, output_csv: str) -> tuple[int, int, int
                     evidence_value = (row.get(URL_COLUMN) or "").strip()
                     if evidence_value:
                         found = URL_PATTERN.findall(evidence_value)
-                        extracted_urls.extend(found or [evidence_value])
+                        extracted_url_count += len(found) if found else 1
                     continue
                 writer.writerow(row)
 
-    return total, removed, not_validated_count, extracted_urls
+    return total, removed, not_validated_count, extracted_url_count
 
 
 if __name__ == "__main__":
     args = _parse_args()
 
     print(f"📖 Reading: {args.input_csv}")
-    total, removed, not_validated_count, extracted_urls = remove_not_validated(args.input_csv, args.output_csv)
+    total, removed, not_validated_count, extracted_url_count = remove_not_validated(args.input_csv, args.output_csv)
     kept = total - removed
     blank_qa_count = removed - not_validated_count
 
@@ -104,7 +112,5 @@ if __name__ == "__main__":
     print(f"Output written to:             {args.output_csv}")
     print(f"{'=' * 60}")
 
-    if extracted_urls:
-        print(f"\nEvidence URLs from removed rows ({len(extracted_urls)}):")
-        for i, url in enumerate(extracted_urls, 1):
-            print(f"{i}. {url}")
+    if extracted_url_count:
+        print(f"\nEvidence values from removed rows: {extracted_url_count} (values omitted from logs)")

@@ -187,7 +187,7 @@ ENVIRONMENT_VARIABLES: dict[str, dict[str, Any]] = {
     "LLM_PROVIDER": {
         "message": "LLM provider selection (gemini or openrouter)",
         "optional": True,
-        "default": PROVIDER_GEMINI,
+        "default": PROVIDER_OPENROUTER,
         "possible_values": [PROVIDER_GEMINI, PROVIDER_OPENROUTER],
     },
 
@@ -315,6 +315,18 @@ ENVIRONMENT_VARIABLES: dict[str, dict[str, Any]] = {
         "message": "Allowed upload file extensions",
         "optional": True,
         "default": [".csv"],
+    },
+
+    # Processing pipeline
+    "CLEANUP_SCRIPT_PATH": {
+        "message": "Post-processing cleanup script path",
+        "optional": True,
+        "default": "scripts/processor/2-remove-nonvalidated-and-empty-evidences.py",
+    },
+    "REMOVE_INVALID_ROWS_FROM_OUTPUT": {
+        "message": "Strip notValidated/Failed/blank-tag rows from the delivered output CSV",
+        "optional": True,
+        "default": True,
     },
 }
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import json
 import logging
 import os
 import shutil
@@ -24,6 +25,11 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from core.config import SERVICE_ROOT, settings
+from core.constants import (
+    EVIDENCE_TYPE_EXTENSIONS,
+    PROCESSING_CONFIG_KEY_EVIDENCE_TYPES,
+    SCHOOL_FILTER_REQUIRED_COLUMN,
+)
 from db.database import SessionLocal
 from models.csv_source_type import CsvSourceType
 from models.execution import Execution
@@ -56,6 +62,7 @@ class ExecutionWorkspace:
     processor_output_dir: Path
     input_csv: Path
     questions_csv: Path
+    school_filter_csv: Path
     preprocessed_csv: Path
     final_output_csv: Path
     checkpoint_file: Path
@@ -282,6 +289,7 @@ def _build_workspace(execution_id: UUID) -> ExecutionWorkspace:
         processor_output_dir=processor_output_dir,
         input_csv=input_dir / "input.csv",
         questions_csv=input_dir / "question.csv",
+        school_filter_csv=input_dir / "school_filter.csv",
         preprocessed_csv=preprocessor_output_dir / "preprocessed_data.csv",
         final_output_csv=processor_output_dir / "merged_output.csv",
         checkpoint_file=processor_output_dir / ".processing_checkpoint.json",
@@ -349,6 +357,60 @@ def _resolve_processor_columns_from_config(db: Session, execution: Execution) ->
         columns["question_text_column"] = question_text_column
 
     return columns
+
+
+def _resolve_evidence_type_extensions_from_config(db: Session, execution: Execution) -> dict[str, list[str]]:
+    """Per-tenant evidence-type -> file-extension map, sourced from
+    CsvSourceType.evidence_types_config so a new type/extension is addable without a deploy.
+    Falls back to core.constants.EVIDENCE_TYPE_EXTENSIONS when no active config row exists.
+    """
+    csv_type_id = (execution.csv_type_id or "").strip()
+    source_type = (
+        db.query(CsvSourceType)
+        .filter(
+            CsvSourceType.tenant_code == execution.tenant_code,
+            CsvSourceType.organization_code == execution.organization_code,
+            CsvSourceType.type_key == csv_type_id,
+            CsvSourceType.is_active.is_(True),
+        )
+        .first()
+        if csv_type_id
+        else None
+    )
+    evidence_types_config = source_type.evidence_types_config if source_type else None
+    if not isinstance(evidence_types_config, list) or not evidence_types_config:
+        return EVIDENCE_TYPE_EXTENSIONS
+
+    return {
+        str(item["key"]): [str(ext) for ext in item.get("extensions", [])]
+        for item in evidence_types_config
+        if item.get("key")
+    }
+
+
+def _resolve_school_filter_column_from_config(db: Session, execution: Execution) -> str:
+    """Per-tenant required column name for an uploaded school-filter CSV, sourced from
+    CsvSourceType.school_filter_config so the column name is changeable per tenant without
+    a deploy. Falls back to core.constants.SCHOOL_FILTER_REQUIRED_COLUMN when no active
+    config row exists.
+    """
+    csv_type_id = (execution.csv_type_id or "").strip()
+    source_type = (
+        db.query(CsvSourceType)
+        .filter(
+            CsvSourceType.tenant_code == execution.tenant_code,
+            CsvSourceType.organization_code == execution.organization_code,
+            CsvSourceType.type_key == csv_type_id,
+            CsvSourceType.is_active.is_(True),
+        )
+        .first()
+        if csv_type_id
+        else None
+    )
+    school_filter_config = source_type.school_filter_config if source_type else None
+    if not isinstance(school_filter_config, dict) or not school_filter_config.get("required_column"):
+        return SCHOOL_FILTER_REQUIRED_COLUMN
+    return str(school_filter_config["required_column"]).strip() or SCHOOL_FILTER_REQUIRED_COLUMN
 
 
 def _run_command(command: list[str], env: dict[str, str], label: str) -> None:
@@ -601,6 +663,12 @@ def process_execution(execution_id: str) -> dict[str, Any]:
         workspace.input_csv.write_bytes(input_bytes)
         workspace.questions_csv.write_bytes(questions_bytes)
 
+        if execution.school_filter_file_url and execution.school_filter_file_size:
+            school_filter_bytes = _run_async(storage_service.download_file(execution.school_filter_file_url))
+            if not school_filter_bytes:
+                raise ExecutionProcessingError("School filter file could not be downloaded from storage.")
+            workspace.school_filter_csv.write_bytes(school_filter_bytes)
+
         # === Dynamic Splitting Logic ===
         # Count rows in input file
         logger.info(f"Analyzing input file for splitting strategy: {workspace.input_csv}")
@@ -630,7 +698,11 @@ def process_execution(execution_id: str) -> dict[str, Any]:
         # threshold_config shape: {"max_relevant_per_user_task": 5}, or None when no cap was requested.
         cap_config = execution.threshold_config if isinstance(execution.threshold_config, dict) else {}
         max_relevant = cap_config.get("max_relevant_per_user_task")
-        is_relevant_limit_enabled = isinstance(max_relevant, int) and max_relevant > 0
+        # bool is an int subclass in Python — isinstance(True, int) is True — so a malformed
+        # evidence_threshold: true from the client would otherwise silently enable a cap of 1.
+        is_relevant_limit_enabled = (
+            isinstance(max_relevant, int) and not isinstance(max_relevant, bool) and max_relevant > 0
+        )
 
         preprocessor_env = {
             **base_env,
@@ -641,6 +713,20 @@ def process_execution(execution_id: str) -> dict[str, Any]:
         question_text_column = configured_columns.get("question_text_column", "")
         if question_task_column:
             preprocessor_env["PREPROCESS_QUESTION_TASK_COLUMN"] = question_task_column
+
+        processing_config = execution.processing_config if isinstance(execution.processing_config, dict) else {}
+        evidence_types = processing_config.get(PROCESSING_CONFIG_KEY_EVIDENCE_TYPES)
+        if not isinstance(evidence_types, list) or not evidence_types:
+            raise ExecutionProcessingError(
+                f"Execution {execution.id} is missing required evidence_types in processing_config"
+            )
+        # Per-tenant type->extension map (DB-driven; see CsvSourceType.evidence_types_config)
+        # passed to both scripts so a new type/extension is addable without a code change.
+        evidence_types_to_validate_json = json.dumps(_resolve_evidence_type_extensions_from_config(db, execution))
+        # Per-tenant required column name for an uploaded school-filter CSV (DB-driven; see
+        # CsvSourceType.school_filter_config), so the column name is changeable without a
+        # code change. Only meaningful when school filtering is actually enabled below.
+        school_filter_column = _resolve_school_filter_column_from_config(db, execution)
 
         preprocessor_cmd = [
             sys.executable,
@@ -659,13 +745,19 @@ def process_execution(execution_id: str) -> dict[str, Any]:
         if enable_split:
             preprocessor_cmd.extend(["--rows-per-file", str(rows_per_file)])
         
-        preprocessor_cmd.extend([
-            "--use-school-filter",
-            "false",
-        ])
+        if execution.school_filter_file_url and execution.school_filter_file_size:
+            preprocessor_cmd.extend([
+                "--filter-csv", str(workspace.school_filter_csv),
+                "--use-school-filter", "true",
+                "--school-filter-column", school_filter_column,
+            ])
+        else:
+            preprocessor_cmd.extend(["--use-school-filter", "false"])
+
+        preprocessor_cmd.extend(["--evidence-types", ",".join(evidence_types)])
+        preprocessor_cmd.extend(["--evidence-types-to-validate", evidence_types_to_validate_json])
         if is_relevant_limit_enabled:
             preprocessor_cmd.extend(["--max-relevant-per-user-task", str(max_relevant)])
-
         _run_command(preprocessor_cmd, preprocessor_env, "Pre-processor script")
 
         # Handle split files or single file based on strategy
@@ -729,6 +821,8 @@ def process_execution(execution_id: str) -> dict[str, Any]:
             str(workspace.questions_csv),
             "--max-processed-rows",
             str(settings.PROCESSOR_MAX_ROWS),
+            "--evidence-types-to-validate",
+            evidence_types_to_validate_json,
         ]
 
         # Per-(user, task) relevant-evidence cap (config resolved above), not a secret —

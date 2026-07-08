@@ -21,7 +21,13 @@ from models.schemas import (
     CriteriaValidationRequest,
     CriteriaValidationResponse,
 )
-from core.constants import PROVIDER_GEMINI, PROVIDER_OPENROUTER
+from core.constants import (
+    PROVIDER_GEMINI,
+    PROVIDER_OPENROUTER,
+    RELEVANCE_TAG_RELEVANT,
+    RELEVANCE_TAG_PARTIAL,
+    RELEVANCE_TAG_IRRELEVANT,
+)
 from utils.llm_provider import generate_content, get_llm_model_name, get_llm_provider_name, get_llm_tokens
 
 logger = logging.getLogger(__name__)
@@ -227,11 +233,11 @@ class CriteriaValidationService:
 
         relevance_tag: str
         if ratio >= 0.5:
-            relevance_tag = "Relevant"
+            relevance_tag = RELEVANCE_TAG_RELEVANT
         elif yes_count > 0:
-            relevance_tag = "Partially Relevant"
+            relevance_tag = RELEVANCE_TAG_PARTIAL
         else:
-            relevance_tag = "Irrelevant"
+            relevance_tag = RELEVANCE_TAG_IRRELEVANT
 
         criteria_results = [
             CriteriaValidationItem(

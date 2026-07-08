@@ -29,9 +29,9 @@ logger = logging.getLogger(__name__)
 async def list(
     config_service: ConfigServiceDep,
     current_user: UserResponse = Depends(AuthService.get_current_user),
-    type: Literal["project"] = Query(...),
+    type: Literal["project", "evidence_type", "school_filter"] = Query(...),
 ):
-    """List config values by type. Current support: type=project."""
+    """List config values by type. Supported: type=project, type=evidence_type, type=school_filter."""
     try:
         items = config_service.list(type, current_user)
         payload = StandardAPIResponse(
@@ -71,15 +71,15 @@ async def get_sample_csv_url(
     config_service: ConfigServiceDep,
     current_user: UserResponse = Depends(AuthService.get_current_user),
     type_id: int = Path(..., description="CSV source type ID"),
-    file_type: Literal["input", "criteria"] = Path(..., description="Sample file type"),
+    file_type: Literal["input", "criteria", "school_filter"] = Path(..., description="Sample file type"),
 ):
     """
     Get signed download URL for sample CSV file.
     
     Args:
         type_id: CSV source type ID
-        file_type: Either 'input' or 'criteria'
-        
+        file_type: One of 'input', 'criteria', or 'school_filter'
+
     Returns:
         Signed download URL with expiration time
     """

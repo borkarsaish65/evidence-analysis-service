@@ -41,6 +41,27 @@ class CsvSourceType(Base):
     # Config
     column_mappings = Column(JSONB, nullable=False)
     evidence_columns = Column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    # Evidence-type/extension registry — [{key, label, extensions}], e.g. {"key": "image",
+    # "label": "Image", "extensions": [".jpg", ...]}. Source of truth for the evidence-type
+    # filter; lets a new type/extension be added per tenant without a code deploy.
+    evidence_types_config = Column(
+        JSONB,
+        nullable=False,
+        server_default=text(
+            "'[{\"key\": \"image\", \"label\": \"Image\", "
+            "\"extensions\": [\".jpg\", \".jpeg\", \".png\", \".gif\", \".webp\", \".bmp\"]}, "
+            "{\"key\": \"pdf\", \"label\": \"PDF\", \"extensions\": [\".pdf\"]}, "
+            "{\"key\": \"excel\", \"label\": \"Excel\", \"extensions\": [\".xlsx\"]}]'::jsonb"
+        ),
+    )
+    # Required header column in an uploaded school-filter CSV — {"required_column": "..."}.
+    # Source of truth for school-filter upload validation and the pre-processor's row
+    # filter; lets the column name change per tenant without a code deploy.
+    school_filter_config = Column(
+        JSONB,
+        nullable=False,
+        server_default=text('\'{"required_column": "UDISE+ SCHOOL CODE"}\'::jsonb'),
+    )
     evidence_context_config = Column(JSONB, nullable=False)
     available_filters = Column(JSONB, nullable=True, server_default=text("'[]'::jsonb"))
     question_config = Column(
@@ -60,6 +81,7 @@ class CsvSourceType(Base):
     # Sample file URLs
     sample_input_file_url = Column(Text, nullable=True)
     sample_criteria_file_url = Column(Text, nullable=True)
+    sample_school_filter_file_url = Column(Text, nullable=True)
 
     # Status and audit
     is_active = Column(Boolean, nullable=False, server_default=text("true"))

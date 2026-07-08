@@ -30,6 +30,7 @@ class Execution(Base):
     criterias_file_url = Column(Text, nullable=True)
     criterias_config = Column(JSONB, nullable=True)
     threshold_config = Column(JSONB, nullable=True)
+    processing_config = Column(JSONB, nullable=True)  # generic per-execution processing options, e.g. {"evidence_types": [...]}
     
     # Status and processing
     status = Column(String(50), nullable=False, default='queued', index=True)  # queued, in_progress, completed, failed
@@ -48,6 +49,8 @@ class Execution(Base):
     criterias_file_size = Column(BigInteger, nullable=True)
     output_file_url = Column(Text, nullable=True)
     output_file_size = Column(BigInteger, nullable=True)
+    school_filter_file_url = Column(Text, nullable=True)
+    school_filter_file_size = Column(BigInteger, nullable=True)
     
     # Processing metadata (Phase 1 additions)
     worker_id = Column(String(100), nullable=True)

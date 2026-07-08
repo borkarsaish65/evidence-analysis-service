@@ -23,6 +23,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from core.config import settings
+from core.constants import ALLOWED_EVIDENCE_TYPES, PROCESSING_CONFIG_KEY_EVIDENCE_TYPES
 from models.csv_source_type import CsvSourceType
 from models.execution import Execution
 from models.schemas import (
@@ -30,6 +31,7 @@ from models.schemas import (
     CloudDownloadableUrlResponse,
     CloudSignedUrlRequest,
     CloudSignedUrlResponse,
+    ExecutionCreate,
     ExecutionCreateRequest,
     ExecutionDetail,
     ExecutionFileCheckpointState,
@@ -53,6 +55,7 @@ from services.background_worker import BackgroundWorker
 from services.email_service import EmailService
 from utils.llm_provider import get_llm_model_name
 from services.storage_service import StorageService
+from core.constants import SCHOOL_FILTER_REQUIRED_COLUMN
 
 logger = logging.getLogger(__name__)
 
@@ -343,6 +346,35 @@ class ExecutionService:
                 if value:
                     return value
         return None
+
+    @staticmethod
+    def _allowed_evidence_type_keys(source_type: CsvSourceType) -> list[str]:
+        evidence_types_config = source_type.evidence_types_config
+        if not isinstance(evidence_types_config, list) or not evidence_types_config:
+            return sorted(ALLOWED_EVIDENCE_TYPES)
+        return sorted({str(item.get("key", "")).strip() for item in evidence_types_config if item.get("key")})
+
+    @staticmethod
+    def _required_school_filter_column(source_type: Optional[CsvSourceType]) -> str:
+        school_filter_config = source_type.school_filter_config if source_type else None
+        if not isinstance(school_filter_config, dict) or not school_filter_config.get("required_column"):
+            return SCHOOL_FILTER_REQUIRED_COLUMN
+        return str(school_filter_config["required_column"]).strip() or SCHOOL_FILTER_REQUIRED_COLUMN
+
+    @staticmethod
+    def _resolve_processing_config(
+        request_data: ExecutionCreate, source_type: CsvSourceType
+    ) -> dict[str, Any]:
+        """Build the processing_config JSONB payload. evidence_types is required and already
+        guaranteed to be a non-empty list by ExecutionCreate's Pydantic validator."""
+        allowed = ExecutionService._allowed_evidence_type_keys(source_type)
+        invalid = [t for t in request_data.evidence_types if t not in allowed]
+        if invalid:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"evidence_types must be a subset of {allowed}, got invalid: {invalid}",
+            )
+        return {PROCESSING_CONFIG_KEY_EVIDENCE_TYPES: request_data.evidence_types}
 
     @staticmethod
     def _build_estimates(row_count: int) -> tuple[Optional[Decimal], Optional[int]]:
@@ -747,11 +779,11 @@ class ExecutionService:
         normalized = (file_type or "").strip().lower()
         if normalized == "criterias":
             return "questions"
-        if normalized in {"input", "questions"}:
+        if normalized in {"input", "questions", "school_filter"}:
             return normalized
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="file_type must be one of: input, questions, criterias",
+            detail="file_type must be one of: input, questions, criterias, school_filter",
         )
 
     @staticmethod
@@ -760,6 +792,8 @@ class ExecutionService:
             return execution.input_file_url
         if file_type in {"questions", "criterias"}:
             return execution.criterias_file_url
+        if file_type == "school_filter":
+            return execution.school_filter_file_url
         return None
 
     @staticmethod
@@ -769,6 +803,9 @@ class ExecutionService:
             return
         if file_type in {"questions", "criterias"}:
             execution.criterias_file_url = file_path
+            return
+        if file_type == "school_filter":
+            execution.school_filter_file_url = file_path
             return
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -782,6 +819,9 @@ class ExecutionService:
             return
         if file_type in {"questions", "criterias"}:
             execution.criterias_file_size = size_bytes
+            return
+        if file_type == "school_filter":
+            execution.school_filter_file_size = size_bytes
             return
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -875,7 +915,7 @@ class ExecutionService:
         missing_columns: Optional[list[str]] = None,
     ) -> None:
         checkpoint = self._checkpoint(execution)
-        file_checkpoint = checkpoint["files"][file_type]
+        file_checkpoint = checkpoint["files"].setdefault(file_type, {})
 
         if uploaded is not None:
             file_checkpoint["uploaded"] = uploaded
@@ -960,6 +1000,7 @@ class ExecutionService:
             if request_data.evidence_threshold is not None
             else None
         )
+        processing_config = self._resolve_processing_config(request_data, source_type)
 
         execution = Execution(
             tenant_code=tenant_code,
@@ -972,6 +1013,7 @@ class ExecutionService:
             states=request_data.states or [],
             criterias_mode=criterias_mode,
             threshold_config=threshold_config,
+            processing_config=processing_config,
             status="draft",
             created_by=current_user.id,
             checkpoint_data={"files": {"input": {}, "questions": {}}},
@@ -1194,7 +1236,12 @@ class ExecutionService:
         execution = self._get_execution_or_404(execution_id, user_id)
         self._ensure_not_started_for_file_changes(execution)
 
-        label = "Input file" if normalized_file_type == "input" else "Questions file"
+        if normalized_file_type == "input":
+            label = "Input file"
+        elif normalized_file_type == "school_filter":
+            label = "School filter file"
+        else:
+            label = "Questions file"
         safe_file_name, normalized_content_type = self._validate_file_descriptor(
             request_data.file.file_name,
             request_data.file.size_bytes,
@@ -1260,7 +1307,12 @@ class ExecutionService:
                 detail=f"{normalized_file_type} file upload not found",
             )
 
-        label = "Input file" if normalized_file_type == "input" else "Questions file"
+        if normalized_file_type == "input":
+            label = "Input file"
+        elif normalized_file_type == "school_filter":
+            label = "School filter file"
+        else:
+            label = "Questions file"
         self._validate_uploaded_metadata(metadata, label)
 
         file_bytes = await self.storage_service.download_file(file_path)
@@ -1271,6 +1323,19 @@ class ExecutionService:
             )
 
         headers, row_count = self._extract_headers_and_row_count(file_bytes, label)
+        if normalized_file_type == "school_filter":
+            source_type = self._get_csv_source_type(
+                execution.tenant_code, execution.organization_code, execution.csv_type_id
+            )
+            required_school_filter_column = self._required_school_filter_column(source_type)
+            if required_school_filter_column not in headers:
+                execution.school_filter_file_url = None
+                execution.school_filter_file_size = None
+                self.db.commit()
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"School filter file must contain a '{required_school_filter_column}' column.",
+                )
         self._set_file_size_by_type(execution, normalized_file_type, int(metadata.get("size_bytes", 0)))
         self._update_file_checkpoint(
             execution,
@@ -1310,7 +1375,12 @@ class ExecutionService:
         execution = self._get_execution_or_404(execution_id, user_id)
         self._ensure_not_started_for_file_changes(execution)
 
-        label = "Input file" if normalized_file_type == "input" else "Questions file"
+        if normalized_file_type == "input":
+            label = "Input file"
+        elif normalized_file_type == "school_filter":
+            label = "School filter file"
+        else:
+            label = "Questions file"
         safe_file_name, normalized_content_type = self._validate_file_descriptor(
             file_name,
             len(file_bytes),
@@ -1335,6 +1405,16 @@ class ExecutionService:
 
         # Extract headers and row count
         headers, row_count = self._extract_headers_and_row_count(file_bytes, label)
+        if normalized_file_type == "school_filter":
+            source_type = self._get_csv_source_type(
+                execution.tenant_code, execution.organization_code, execution.csv_type_id
+            )
+            required_school_filter_column = self._required_school_filter_column(source_type)
+            if required_school_filter_column not in headers:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"School filter file must contain a '{required_school_filter_column}' column.",
+                )
 
         # Update execution with file path and metadata
         self._set_file_path_by_type(execution, normalized_file_type, file_path)
@@ -1655,6 +1735,7 @@ class ExecutionService:
             if request_data.evidence_threshold is not None
             else None
         )
+        processing_config = self._resolve_processing_config(request_data, source_type)
 
         execution = Execution(
             tenant_code=tenant_code,
@@ -1667,6 +1748,7 @@ class ExecutionService:
             states=request_data.states or [],
             criterias_mode=criterias_mode,
             threshold_config=threshold_config,
+            processing_config=processing_config,
             status="draft",
             created_by=current_user.id,
             input_file_size=request_data.input_file.size_bytes,
@@ -1861,7 +1943,12 @@ class ExecutionService:
                 detail=f"{normalized_file_type} file was not found in storage.",
             )
 
-        label = "Input file" if normalized_file_type == "input" else "Questions file"
+        if normalized_file_type == "input":
+            label = "Input file"
+        elif normalized_file_type == "school_filter":
+            label = "School filter file"
+        else:
+            label = "Questions file"
         headers, row_count, preview_rows, _ = self._parse_csv_preview(
             file_bytes,
             label,
@@ -1899,11 +1986,14 @@ class ExecutionService:
                 "criterias_mode": execution.criterias_mode,
                 "criterias_config": execution.criterias_config,
                 "threshold_config": execution.threshold_config,
+                "processing_config": execution.processing_config,
                 "actual_cost": self._to_float(execution.actual_cost),
                 "estimated_cost": self._to_float(execution.estimated_cost),
                 "input_file_size": execution.input_file_size,
                 "criterias_file_size": execution.criterias_file_size,
                 "output_file_size": execution.output_file_size,
+                "school_filter_file_url": execution.school_filter_file_url,
+                "school_filter_file_size": execution.school_filter_file_size,
                 "upload_completed_at": execution.upload_completed_at,
                 "checkpoint_data": checkpoint,
                 "input_file_status": self._checkpoint_file_status(checkpoint, "input"),
@@ -2144,6 +2234,7 @@ class ExecutionService:
             'states',
             'program_ref_id',
             'program_name',
+            PROCESSING_CONFIG_KEY_EVIDENCE_TYPES,
         }
 
         for field in allowed_fields:
@@ -2166,6 +2257,39 @@ class ExecutionService:
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail="states must be a non-empty array if provided."
                     )
+
+            if field == PROCESSING_CONFIG_KEY_EVIDENCE_TYPES:
+                # evidence_types doesn't live on the ORM model directly — it rides inside the
+                # generic processing_config JSONB blob, merged so other future keys survive.
+                # Required field: clearing it to empty/null would silently put the execution
+                # back into "no restriction", so that's rejected rather than allowed.
+                if not value:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="evidence_types cannot be cleared; provide a non-empty list of allowed types.",
+                    )
+                current_processing_config = (
+                    dict(execution.processing_config) if isinstance(execution.processing_config, dict) else {}
+                )
+                source_type = self._get_csv_source_type(
+                    tenant_code=execution.tenant_code,
+                    organization_code=execution.organization_code,
+                    type_key=execution.csv_type_id or "",
+                )
+                allowed = (
+                    self._allowed_evidence_type_keys(source_type)
+                    if source_type
+                    else sorted(ALLOWED_EVIDENCE_TYPES)
+                )
+                invalid = [t for t in value if t not in allowed]
+                if invalid:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"evidence_types must be a subset of {allowed}, got invalid: {invalid}",
+                    )
+                current_processing_config[PROCESSING_CONFIG_KEY_EVIDENCE_TYPES] = value
+                execution.processing_config = current_processing_config
+                continue
 
             # Optional fields support explicit clears via null.
             setattr(execution, field, value)

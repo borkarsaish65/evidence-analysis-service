@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.config import settings
+from core.constants import DEFAULT_EVIDENCE_TYPES_CONFIG
 from models.csv_source_type import CsvSourceType
 from services.auth_service import AuthService
 from db.database import SessionLocal
@@ -156,6 +157,7 @@ def seed_default_csv_source_types(db: Session) -> None:
             "optional_columns": [],
         },
         default_thresholds={"relevant": 0.7, "partial": 0.5},
+        evidence_types_config=DEFAULT_EVIDENCE_TYPES_CONFIG,
         is_active=True,
         created_by=admin_user_id,
         updated_by=admin_user_id,
