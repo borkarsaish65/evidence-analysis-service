@@ -14,6 +14,12 @@ from pathlib import Path
 env_path = Path(__file__).parent.parent / '.env'
 load_dotenv(dotenv_path=env_path)
 
+# Allow importing from the service package (core/, etc.) — mirrors 1-main-parallel-script.py
+SERVICE_ROOT = Path(__file__).resolve().parents[2]
+if str(SERVICE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SERVICE_ROOT))
+from core.constants import EVIDENCE_TYPE_EXTENSIONS as DEFAULT_EVIDENCE_TYPE_EXTENSIONS
+
 def str2bool(val):
     return str(val).lower() in ("1", "true", "yes")
 
@@ -31,6 +37,25 @@ def _parse_args():
     parser.add_argument("--split-files", default=None, choices=["yes", "no"], help="Split output files or not")
     parser.add_argument("--rows-per-file", default=None, type=int, help="Rows per split file")
     parser.add_argument("--use-school-filter", default=None, help="Enable school filtering (true/false)")
+    parser.add_argument("--main-batch-rows", default=None, type=int, help="Target rows per main batch")
+    parser.add_argument("--max-main-batches", default=None, type=int, help="Hard cap on number of main batches")
+    parser.add_argument(
+        "--skip-batch-cut",
+        action="store_true",
+        help="Run the normal filter/sort/split path even if MAIN_FILE_SPLIT is on — "
+        "used for the per-batch sub-invocations, whose input is already one main batch.",
+    )
+    parser.add_argument(
+        "--evidence-types",
+        default=None,
+        help="Comma list of allowed evidence types (image,pdf,excel); required",
+    )
+    parser.add_argument(
+        "--evidence-types-to-validate",
+        default=None,
+        help="JSON object mapping evidence type key -> list of file extensions "
+        "(per-tenant, from CsvSourceType.evidence_types_config); absent = core.constants default",
+    )
     parser.add_argument("--max-relevant-per-user-task", default=None, type=int, help="Per-(UUID, task) relevant-evidence cap; enables group-aware splitting when set")
     return parser.parse_args()
 
@@ -59,6 +84,16 @@ use_school_filter_value = (
 )
 USE_SCHOOL_FILTER = str2bool(use_school_filter_value)  # Set True to filter by school_list.csv
 
+if not ARGS.evidence_types:
+    print("ERROR: --evidence-types is required but was empty.")
+    sys.exit(1)
+ALLOWED_EVIDENCE_TYPES = {
+    t.strip().lower() for t in ARGS.evidence_types.split(",") if t.strip()
+}
+if not ALLOWED_EVIDENCE_TYPES:
+    print("ERROR: --evidence-types is required but was empty.")
+    sys.exit(1)
+
 # === SPLIT CONFIGURATION ===
 SPLIT_FILES = ARGS.split_files or os.getenv("PREPROCESS_SPLIT_FILES") or os.getenv("SPLIT_FILES", "yes")
 ROWS_PER_FILE = ARGS.rows_per_file or int(os.getenv("PREPROCESS_ROWS_PER_FILE", os.getenv("ROWS_PER_FILE", "15000")))
@@ -69,22 +104,45 @@ ROWS_PER_FILE = ARGS.rows_per_file or int(os.getenv("PREPROCESS_ROWS_PER_FILE", 
 # Off by default → original size-only splitting.
 GROUP_AWARE_SPLIT = ARGS.max_relevant_per_user_task is not None
 
+# === MAIN-BATCH CONFIGURATION ===
+# MAIN_FILE_SPLIT is the on/off switch (mirrors the sister repo's SPLIT_FILES=yes/no
+# convention): "true" cuts the filtered+sorted rows into sequential main batches before
+# the normal per-file split runs on each one; "no"/absent processes everything as a
+# single main file, today's behavior, unchanged.
+MAIN_FILE_SPLIT = str2bool(os.getenv("MAIN_FILE_SPLIT", "no"))
+# Sizing target (rows per batch) — batch COUNT is derived from this, not set directly,
+# same shape as ROWS_PER_FILE deriving the fine-split file count above.
+MAIN_BATCH_ROWS_PER_BATCH = ARGS.main_batch_rows or int(os.getenv("MAIN_BATCH_ROWS_PER_BATCH", "10000"))
+# Safety ceiling, not a target: only overrides the derived count above if it would
+# otherwise exceed this many batches (then the effective batch size grows instead).
+MAX_MAIN_BATCHES = ARGS.max_main_batches or int(os.getenv("MAX_MAIN_BATCHES", "200"))
+
 # Debug: Print loaded configuration
-print(f"🔧 Configuration Loaded:")
+print("🔧 Configuration Loaded:")
 print(f"   SPLIT_FILES: {SPLIT_FILES}")
 print(f"   ROWS_PER_FILE: {ROWS_PER_FILE}")
 print(f"   GROUP_AWARE_SPLIT: {GROUP_AWARE_SPLIT}")
+print(f"   MAIN_FILE_SPLIT: {MAIN_FILE_SPLIT}")
+print(f"   MAIN_BATCH_ROWS_PER_BATCH: {MAIN_BATCH_ROWS_PER_BATCH}")
+print(f"   MAX_MAIN_BATCHES: {MAX_MAIN_BATCHES}")
 print(f"   USE_SCHOOL_FILTER: {USE_SCHOOL_FILTER}")
+print(f"   ALLOWED_EVIDENCE_TYPES: {sorted(ALLOWED_EVIDENCE_TYPES)}")
 print(f"   TASK_MATCH_COLUMN_CONFIG: {TASK_MATCH_COLUMN_CONFIG or '(missing)'}")
 print(f"   QUESTION_TASK_COLUMN_FALLBACK: {DEFAULT_QUESTION_TASK_COLUMN}")
 print(f"   INPUT_TASK_COLUMN_FALLBACK: {DEFAULT_INPUT_TASK_COLUMN}")
 print()
 
 # === EVIDENCE FORMATS ===
-IMAGE_FORMATS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
-PDF_FORMATS = {".pdf"}
-EXCEL_FORMATS = {".xlsx", ".xls"}
-ALL_VALID_FORMATS = IMAGE_FORMATS | PDF_FORMATS | EXCEL_FORMATS
+# Per-tenant type->extension map, passed in by execution_processor.py from
+# CsvSourceType.evidence_types_config; falls back to the core.constants default when this
+# script is run standalone (no execution context to resolve tenant config from).
+if ARGS.evidence_types_to_validate:
+    EVIDENCE_TYPE_EXTENSIONS = {
+        str(key): [str(ext).lower() for ext in exts]
+        for key, exts in json.loads(ARGS.evidence_types_to_validate).items()
+    }
+else:
+    EVIDENCE_TYPE_EXTENSIONS = DEFAULT_EVIDENCE_TYPE_EXTENSIONS
 
 # Create output directory
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -94,6 +152,7 @@ skip_task_not_in_questions = 0
 skip_evidence_null = 0
 skip_school_mismatch = 0
 skip_invalid_evidence = 0  # Renamed from skip_non_image to handle all invalid evidence types
+skip_evidence_type_excluded = 0  # Evidence type valid but not in ALLOWED_EVIDENCE_TYPES
 total_input_rows = 0 # This will be set correctly below
 
 # === Step 1: Load FILTER_CSV school codes into a set ===
@@ -278,23 +337,19 @@ def normalize_task_name(name):
 
 # === Helper function to determine evidence type ===
 def get_evidence_type(url):
-    """Determine the evidence type from URL. Returns: 'image', 'pdf', 'excel', or None"""
+    """Determine the evidence type from URL by matching its extension against the
+    configured EVIDENCE_TYPE_EXTENSIONS map. Returns the type key (e.g. 'image', 'pdf',
+    'excel', or any tenant-configured key), or None if no extension matched."""
     url = clean_cell(url) # Clean the URL string first for *checking*
     if not url or url.lower() == "null":
         return None
     try:
         parsed = urlparse(url)
         path = parsed.path.lower()
-        for ext in IMAGE_FORMATS:
-            if path.endswith(ext):
-                return "image"
-        for ext in PDF_FORMATS:
-            if path.endswith(ext):
-                return "pdf"
-        for ext in EXCEL_FORMATS:
-            if path.endswith(ext):
-                return "excel"
-    except:
+        for type_key, extensions in EVIDENCE_TYPE_EXTENSIONS.items():
+            if any(path.endswith(ext) for ext in extensions):
+                return type_key
+    except Exception:
         pass
     return None
 
@@ -430,6 +485,11 @@ for row in tqdm(all_rows, total=total_input_rows, desc="Processing input CSV"):
         skip_invalid_evidence += 1
         continue
 
+    # Rule 3b: Skip if evidence type is valid but excluded by the execution's evidence-type filter
+    if evidence_type not in ALLOWED_EVIDENCE_TYPES:
+        skip_evidence_type_excluded += 1
+        continue
+
     # === Step 4: Fill additional columns & Clean District ===
     # _q already resolved above in Rule 1 — reuse directly.
     row["Task Evidence Question"] = _q
@@ -469,6 +529,78 @@ if GROUP_AWARE_SPLIT and not _group_aware_active:
 if _group_aware_active:
     filtered_rows.sort(key=lambda r: (str(r[_uuid_idx]), str(r[_task_idx])))
     print(f"✅ Sorted {len(filtered_rows)} rows by (UUID, {input_task_column}) for group-aware splitting.")
+
+# === Step 4c: Main-batch cut (sequential processing of very large uploads) ===
+# Runs once, before the normal Step 5 split. Cuts filtered_rows into N main batches —
+# written as their own filtered CSVs, NOT split_*.csv — which the service then feeds back
+# through this same script one at a time (with --skip-batch-cut) to get each batch's normal
+# fine-grained split_*.csv files. Skipped entirely for the per-batch sub-invocations.
+if MAIN_FILE_SPLIT and not ARGS.skip_batch_cut:
+    num_batches = math.ceil(len(filtered_rows) / MAIN_BATCH_ROWS_PER_BATCH) if filtered_rows else 0
+    if num_batches > MAX_MAIN_BATCHES:
+        print(f"⚠️  Natural batch count {num_batches} exceeds MAX_MAIN_BATCHES ({MAX_MAIN_BATCHES}) — "
+              f"capping batch count and growing effective batch size instead.")
+        num_batches = MAX_MAIN_BATCHES
+    effective_batch_rows = math.ceil(len(filtered_rows) / num_batches) if num_batches else len(filtered_rows)
+
+    # Same accumulator + group-boundary technique as the fine split below, just at the
+    # coarser main-batch grain — a (UUID, task) group must never span two main batches,
+    # otherwise it could also end up split across two DIFFERENT fine split files later.
+    if _group_aware_active:
+        batches = []
+        current = []
+        for j, r in enumerate(filtered_rows):
+            current.append(r)
+            at_target = len(current) >= effective_batch_rows
+            is_last = j == len(filtered_rows) - 1
+            this_key = (str(r[_uuid_idx]), str(r[_task_idx]))
+            next_key = None if is_last else (
+                str(filtered_rows[j + 1][_uuid_idx]), str(filtered_rows[j + 1][_task_idx])
+            )
+            at_boundary = is_last or next_key != this_key
+            if at_target and at_boundary:
+                batches.append(current)
+                current = []
+        if current:
+            batches.append(current)
+    else:
+        batches = [
+            filtered_rows[i * effective_batch_rows:(i + 1) * effective_batch_rows]
+            for i in range(math.ceil(len(filtered_rows) / effective_batch_rows))
+        ] if filtered_rows else []
+
+    padding_width = max(1, len(str(len(batches))))
+    actual_rows_written = 0
+    for i, batch in enumerate(batches):
+        batch_file = os.path.join(OUTPUT_DIR, f"filtered_batch_{str(i+1).zfill(padding_width)}.csv")
+        with open(batch_file, "w", newline='', encoding="utf-8") as outfile:
+            writer = csv.writer(outfile)
+            writer.writerow(final_header)
+            writer.writerows(batch)
+        actual_rows_written += len(batch)
+        print(f"✅ Created: {batch_file} ({len(batch)} rows)")
+        if _group_aware_active and len(batch) > 2 * effective_batch_rows:
+            print(f"⚠️  {os.path.basename(batch_file)} has {len(batch)} rows "
+                  f"(>2× target {effective_batch_rows}) — one (UUID, task) group is oversized.")
+
+    batch_manifest = {
+        "total_batches": len(batches),
+        "rows_per_batch_target": effective_batch_rows,
+        "total_rows": len(filtered_rows),
+        "actual_rows_written": actual_rows_written,
+        "group_aware": _group_aware_active,
+        "max_main_batches": MAX_MAIN_BATCHES,
+    }
+    with open(os.path.join(OUTPUT_DIR, "batch_manifest.json"), "w", encoding="utf-8") as mf:
+        json.dump(batch_manifest, mf, indent=2)
+
+    if actual_rows_written != len(filtered_rows):
+        print(f"⚠️  WARNING: Row count mismatch! Expected {len(filtered_rows)}, wrote {actual_rows_written}")
+    else:
+        print(f"✅ Validated: All {actual_rows_written} rows written across {len(batches)} main batches")
+    print(f"Mode: Main-batch cut into {len(batches)} batches (~{effective_batch_rows} rows each) — "
+          f"exiting before fine-grained split; each batch is split separately.")
+    exit()
 
 # === Step 5: Output - Single file or Multiple files based on configuration ===
 if SPLIT_FILES.lower() == "no":
@@ -542,7 +674,7 @@ else:
         actual_rows_written += len(chunk)
         print(f"✅ Created: {output_file} (rows {rows_before+1}-{rows_before+len(chunk)}, {len(chunk)} rows)")
         if _group_aware_active and len(chunk) > 2 * ROWS_PER_FILE:
-            print(f"⚠️  {os.path.basename(output_file)} has {len(chunk)} rows (>2× target {ROWS_PER_FILE}) — one (UUID, task) group is oversized.")
+            print(f"⚠️  {os.path.basename(output_file)} has {len(chunk)} rows (>2x target {ROWS_PER_FILE}) — one (UUID, task) group is oversized.")
         rows_before += len(chunk)
 
     # Create split manifest
@@ -590,6 +722,9 @@ print(f"{'Task Evidence empty or null':<50} {skip_evidence_null:<10} {remaining_
 
 remaining_after_invalid = remaining_after_evidence - skip_invalid_evidence
 print(f"{'Task Evidence is not valid (not image/pdf/excel)':<50} {skip_invalid_evidence:<10} {remaining_after_invalid}")
+
+remaining_after_type_excluded = remaining_after_invalid - skip_evidence_type_excluded
+print(f"{'Evidence type excluded by execution filter':<50} {skip_evidence_type_excluded:<10} {remaining_after_type_excluded}")
 
 print(f"\n{'='*70}")
 print(f"Final output CSV rows: {len(filtered_rows)}")

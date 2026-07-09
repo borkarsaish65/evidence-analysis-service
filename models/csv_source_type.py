@@ -41,6 +41,19 @@ class CsvSourceType(Base):
     # Config
     column_mappings = Column(JSONB, nullable=False)
     evidence_columns = Column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    # Evidence-type/extension registry — [{key, label, extensions}], e.g. {"key": "image",
+    # "label": "Image", "extensions": [".jpg", ...]}. Source of truth for the evidence-type
+    # filter; lets a new type/extension be added per tenant without a code deploy.
+    evidence_types_config = Column(
+        JSONB,
+        nullable=False,
+        server_default=text(
+            "'[{\"key\": \"image\", \"label\": \"Image\", "
+            "\"extensions\": [\".jpg\", \".jpeg\", \".png\", \".gif\", \".webp\", \".bmp\"]}, "
+            "{\"key\": \"pdf\", \"label\": \"PDF\", \"extensions\": [\".pdf\"]}, "
+            "{\"key\": \"excel\", \"label\": \"Excel\", \"extensions\": [\".xlsx\"]}]'::jsonb"
+        ),
+    )
     evidence_context_config = Column(JSONB, nullable=False)
     available_filters = Column(JSONB, nullable=True, server_default=text("'[]'::jsonb"))
     question_config = Column(
