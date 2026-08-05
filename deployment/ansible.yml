@@ -39,7 +39,7 @@
 
     - name: Clone the repository
       git:
-        repo: https://github.com/ELEVATE-Project/evidence-analysis-service.git
+        repo: https://github.com/borkarsaish65/evidence-analysis-service.git
         dest: "{{ release_path }}"
         clone: yes
         update: yes
