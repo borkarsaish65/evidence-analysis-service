@@ -774,7 +774,14 @@ class ExecutionService:
         reserved_columns = cls.RESERVED_OUTPUT_COLUMNS | set(input_columns or [])
 
         decoded_content = cls._decode_csv_bytes(file_bytes)
-        rows = list(csv.DictReader(io.StringIO(decoded_content)))
+        reader = csv.DictReader(io.StringIO(decoded_content))
+        # Strip header names the same way `headers` (above) was derived — otherwise a
+        # stray space in the header row (e.g. " field_name") makes every row.get("field_name")
+        # below return None, silently skipping all extraction-field validation for the
+        # whole file even though the presence checks above already passed.
+        if reader.fieldnames:
+            reader.fieldnames = [(name or "").strip() for name in reader.fieldnames]
+        rows = list(reader)
 
         # Normalized via _normalize_task_name_for_processor_matching (lowercase +
         # numeric-prefix spacing, not just quote/whitespace/NFC) to exactly match the

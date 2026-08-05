@@ -807,6 +807,12 @@ def load_questions_mapping(questions_file):
     extra_fields_by_task = {}  # normalized task key -> list of field configs
     try:
         df_questions = pd.read_csv(questions_file)
+        # Strip stray whitespace from header names (e.g. " field_name") so the raw
+        # column-name checks below (has_extraction_columns, row.get("field_name")/
+        # ("field_description")/("value_type")) match a padded header the same way
+        # the upload-validation side already does — otherwise a padded header disables
+        # extraction for the whole run without any error.
+        df_questions.columns = [str(col).strip() for col in df_questions.columns]
         task_column = _resolve_column(
             df_questions.columns,
             QUESTION_TASK_COLUMN,
